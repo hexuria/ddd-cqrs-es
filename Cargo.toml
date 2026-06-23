@@ -1,0 +1,16 @@
+[package]
+name = "ddd_cqrs_es"
+version = "0.1.0"
+edition = "2021"
+authors = ["Uriah G"]
+description = "A lightweight DDD, CQRS, and Event Sourcing framework for Rust"
+license = "MIT"
+repository = "https://example.com/ddd_cqrs_es"
+keywords = ["ddd", "cqrs", "event-sourcing", "events"]
+categories = ["development-tools", "rust-patterns"]
+
+[lib]
+name = "ddd_cqrs_es"
+path = "src/lib.rs"
+
+[dependencies]
