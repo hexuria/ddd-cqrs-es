@@ -62,6 +62,15 @@ where
         Self::new(client)
     }
 
+    /// Connects to PostgreSQL using [`NoTls`] and a custom table name.
+    pub fn connect_with_table_name(
+        params: &str,
+        table_name: impl Into<String>,
+    ) -> Result<Self, EventStoreError> {
+        let client = Client::connect(params, NoTls).map_err(map_postgres_error)?;
+        Self::with_table_name(client, table_name)
+    }
+
     /// Creates a PostgreSQL event store using the default `events` table.
     pub fn new(client: Client) -> Result<Self, EventStoreError> {
         Self::with_table_name(client, "events")

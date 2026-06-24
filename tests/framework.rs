@@ -7,6 +7,7 @@ use ddd_cqrs_es::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -173,6 +174,37 @@ fn sqlite_store_passes_reusable_contract() {
     assert_event_store_contract::<Counter, _>(
         ddd_cqrs_es::SqliteEventStore::<Counter>::in_memory().unwrap(),
         "sqlite-contract-counter".to_owned(),
+        CounterEvent::Created,
+        CounterEvent::Incremented { by: 1 },
+    );
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_store_passes_reusable_contract_when_url_is_provided() {
+    let Ok(database_url) = std::env::var("DDD_CQRS_ES_POSTGRES_URL") else {
+        eprintln!("skipping live Postgres contract test: DDD_CQRS_ES_POSTGRES_URL is not set");
+        return;
+    };
+    let table_name = format!(
+        "events_live_contract_{}_{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+
+    let store = ddd_cqrs_es::PostgresEventStore::<Counter>::connect_with_table_name(
+        &database_url,
+        table_name,
+    )
+    .unwrap();
+    store.initialize_schema().unwrap();
+
+    assert_event_store_contract::<Counter, _>(
+        store,
+        "postgres-contract-counter".to_owned(),
         CounterEvent::Created,
         CounterEvent::Incremented { by: 1 },
     );

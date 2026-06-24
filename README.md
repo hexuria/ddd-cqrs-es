@@ -160,9 +160,16 @@ ddd_cqrs_es = { path = "../ddd_cqrs_es", features = ["postgres"] }
 
 ```rust
 let store = ddd_cqrs_es::PostgresEventStore::<MyAggregate>::connect(
-    "host=localhost user=postgres dbname=events"
+    "host=localhost port=5432 user=uriah dbname=events"
 )?;
 store.initialize_schema()?;
+```
+
+Run the live Postgres contract test by providing a connection string:
+
+```bash
+DDD_CQRS_ES_POSTGRES_URL='host=localhost port=5432 user=uriah dbname=ddd_cqrs_es_live' \
+  cargo test --features postgres postgres_store_passes_reusable_contract_when_url_is_provided
 ```
 
 ## Design Notes

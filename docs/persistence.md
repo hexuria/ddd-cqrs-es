@@ -50,9 +50,17 @@ uses a unique `(aggregate_type, aggregate_id, revision)` constraint.
 
 ```rust
 let store = ddd_cqrs_es::PostgresEventStore::<MyAggregate>::connect(
-    "host=localhost user=postgres dbname=events"
+    "host=localhost port=5432 user=uriah dbname=events"
 )?;
 store.initialize_schema()?;
+```
+
+The integration suite includes an opt-in live contract test. Set
+`DDD_CQRS_ES_POSTGRES_URL` to run it:
+
+```bash
+DDD_CQRS_ES_POSTGRES_URL='host=localhost port=5432 user=uriah dbname=ddd_cqrs_es_live' \
+  cargo test --features postgres postgres_store_passes_reusable_contract_when_url_is_provided
 ```
 
 Durable adapters should map concurrency failures to `ConcurrencyError` and
