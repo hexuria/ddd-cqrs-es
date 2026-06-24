@@ -24,6 +24,8 @@ chrono = ["dep:chrono"]
 tracing = ["dep:tracing"]
 postgres = ["json", "dep:postgres"]
 sqlite = ["json", "dep:rusqlite"]
+wasm = ["uuid/js"]
+
 
 [dependencies]
 async-trait = { version = "0.1", optional = true }

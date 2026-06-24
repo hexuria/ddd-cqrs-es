@@ -1,9 +1,9 @@
 ---
-title: Behavior-Driven Development Testing
-description: Discover why Event Sourcing is a unit-testing superpower and learn how to write robust aggregate tests.
+title: 3.1. Domain Testing
+description: Run fast, deterministic unit tests for your business invariants.
 ---
 
-One of the most powerful benefits of Event Sourcing is how it transforms your testing capabilities. 
+One of the most powerful benefits of Event Sourcing is how it transforms your unit testing capabilities. 
 
 In a traditional CRUD system, writing unit tests for complex business rules is painful. You have to write extensive setup code, mock out databases or network clients, pre-populate schema rows, execute the action, and then query the database to assert that the state changed correctly.
 
@@ -47,7 +47,7 @@ mod tests {
     fn test_successful_bank_account_lifecycle() {
         let account_id = "account-123".to_owned();
 
-        // Test 1: Opening a new account emits AccountOpened
+        // Scenario 1: Opening a new account emits AccountOpened
         AggregateFixture::<BankAccount>::new()
             .given(vec![]) // Establish no pre-existing events
             .when(BankAccountCommand::OpenAccount {
@@ -60,7 +60,7 @@ mod tests {
             }])
             .then_expect_revision(1); // Aggregate should now be at revision 1
 
-        // Test 2: Depositing money on an open account succeeds
+        // Scenario 2: Depositing money on an open account succeeds
         AggregateFixture::<BankAccount>::new()
             .given(vec![
                 // 1. Establish the history: the account is already open
@@ -78,13 +78,13 @@ mod tests {
     fn test_failed_business_rule_validations() {
         let account_id = "account-123".to_owned();
 
-        // Test 1: Cannot deposit money on an account that has not been opened yet
+        // Scenario 1: Cannot deposit money on an account that has not been opened yet
         AggregateFixture::<BankAccount>::new()
             .given(vec![]) // No history
             .when(BankAccountCommand::DepositMoney { amount: 100 })
             .then_expect_error(BankAccountError::AccountNotYetOpen);
 
-        // Test 2: Cannot withdraw more money than the current available balance
+        // Scenario 2: Cannot withdraw more money than the current available balance
         AggregateFixture::<BankAccount>::new()
             .given(vec![
                 // Replay history to establish a balance of $100

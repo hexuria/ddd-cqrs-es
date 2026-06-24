@@ -6,88 +6,67 @@ Decouple your core business logic completely from databases, serialization, web 
 
 ---
 
-## Quick Installation
+## Installation
 
-Add the crate as a path dependency in your `Cargo.toml`:
+Add the crate as a dependency in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ddd_cqrs_es = { path = "../ddd_cqrs_es" }
+ddd_cqrs_es = { path = "../ddd" }
 ```
 
-To enable durable adapters:
-- **SQLite Support:** `features = ["sqlite"]`
-- **PostgreSQL Support:** `features = ["postgres"]`
-
----
-
-## Quick Usage
-
-Define your command, event, and state. Execute a transaction:
-
-```rust
-use ddd_cqrs_es::{Aggregate, InMemoryEventStore, Repository, Metadata};
-
-// 1. Define command, event, state, and implement the Aggregate trait.
-// (See docs/getting-started for the complete example code)
-
-let store = InMemoryEventStore::<BankAccount>::new();
-let repo = Repository::new(store);
-let account_id = "account_abc123".to_owned();
-
-// 2. Execute business validation and persist events in a transaction
-repo.execute(
-    &account_id,
-    BankAccountCommand::DepositMoney { amount: 100 },
-    Metadata::default(),
-)?;
-
-// 3. Rebuild the aggregate state by replaying past events in-memory
-let loaded = repo.load(&account_id)?;
-assert_eq!(loaded.state.balance(), 100);
-```
+To enable durable database adapters:
+* **SQLite Support:** Enable the `"sqlite"` feature.
+* **PostgreSQL Support:** Enable the `"postgres"` feature.
 
 ---
 
 ## Detailed Conceptual Guides
 
-Our documentation is structured around explaining the **theoretical concepts and patterns** before jumping into code. Each guide includes extensive theoretical discussions, visual architectural diagrams, and full production-ready code.
+Our documentation is structured around explaining core theoretical concepts and patterns before transitioning to code. The layout is divided into 5 learning modules:
 
-Explore our guides in the [`/docs`](./docs) directory:
+### 1. The Patterns (Theory)
+* [**1.1. Domain-Driven Design**](./docs/theory/ddd.md) — Ubiquitous Language, Entities, Value Objects, and Aggregate Root transactional boundaries.
+* [**1.2. CQRS**](./docs/theory/cqrs.md) — Separating read vs write pipelines.
+* [**1.3. Making Changes to State**](./docs/theory/state-changes.md) — Command handling validation vs deterministic event application.
+* [**1.4. Queries**](./docs/theory/queries.md) — Pre-calculating read models for high-performance views.
+* [**1.5. Event Sourcing**](./docs/theory/event-sourcing.md) — Historical fact logs, state reconstitution, and end-to-end command life cycle.
 
-### 🚀 [Getting Started Guide](./docs/getting-started.md)
-* **What you'll learn:** The core mechanics of Event Sourcing, how Aggregate state is rebuilt via history replay instead of CRUD overwrites, and how to write your first Aggregate command handler in Rust.
+### 2. Getting Started (Tutorial)
+* [**2.1. Add Commands**](./docs/tutorial/commands.md) — Define user intent enums.
+* [**2.2. Add Domain Events**](./docs/tutorial/events.md) — Implement past-tense fact enums and the `DomainEvent` trait.
+* [**2.3. Add an Error and Service**](./docs/tutorial/errors.md) — Handle validation failures with domain-specific errors.
+* [**2.4. Add an Aggregate**](./docs/tutorial/aggregate.md) — Build the state struct and implement the `Aggregate` trait.
 
-### 🏛️ [Architecture & Design Guide](./docs/architecture.md)
-* **What you'll learn:** DDD concepts (Aggregate Roots as transactional consistency boundaries, Ubiquitous Language, Entities vs Value Objects) and the CQRS write/read responsibility split.
-* Includes the comprehensive command pipeline and read model propagation sequence diagrams.
+### 3. Domain Tests
+* [**3.1. Adding More Complex Logic**](./docs/testing/complex-logic.md) — Unit test your aggregates deterministically in microseconds using the `AggregateFixture` BDD framework (`Given` -> `When` -> `Then`).
 
-### 💾 [Persistence & Event Storage Guide](./docs/persistence.md)
-* **What you'll learn:** The append-only ledger model, designing durable schemas, and why Optimistic Concurrency Control (`ExpectedRevision`) is essential for stateless horizontal scaling.
-* Covers configuration of in-memory, SQLite, and PostgreSQL database adapters.
+### 4. Configuring a (test) Application
+* [**4.1. An Event Store**](./docs/config-app/event-store.md) — Initialize a thread-safe `InMemoryEventStore`.
+* [**4.2. A Simple Query**](./docs/config-app/simple-query.md) — Build an in-memory `Projection` read view.
+* [**4.3. Putting Everything Together**](./docs/config-app/assembly.md) — Tie the write-side repository and read-side projection runner into an executable entry point.
 
-### 👁️ [Projections & Read Models Guide](./docs/projections.md)
-* **What you'll learn:** Eventual consistency, asynchronous read-model materialization, sequence checkpoint tracking, and why projection appliers must be strictly idempotent.
-
-### 🧪 [Behavior-Driven Development Guide](./docs/testing.md)
-* **What you'll learn:** Why Event Sourcing is a unit-testing superpower. Write clean, fast BDD tests using the `AggregateFixture` API (`Given` history -> `When` command -> `Then` expect events).
+### 5. Building an Application
+* [**5.1. Persisted Event Store**](./docs/production/persisted-store.md) — Connect SQLite and PostgreSQL adapters with Optimistic Concurrency Control (OCC).
+* [**5.2. Queries with Persisted Views**](./docs/production/persisted-views.md) — Manage multi-process projections asynchronously using checkpoint sequence offsets.
+* [**5.3. Including Metadata**](./docs/production/metadata.md) — Attach correlation, causation, actor, and tenant headers for enterprise audit tracing.
+* [**5.4. Event Upcasters**](./docs/production/upcasters.md) — Handle live event schema evolution smoothly using `EventUpcaster` byte transforms.
 
 ---
 
 ## Local Documentation Server
 
-We utilize **Mintlify** to render a beautiful, modern documentation website. To preview the documentation locally with live-reloading:
+We utilize **Mintlify** to render a beautiful, modern documentation website. To preview the site locally with hot-reloading:
 
-1. Install the Mint CLI:
-   ```bash
-   npm install -g mintlify
-   ```
-2. Navigate to the documentation directory and run the dev server:
+1. Navigate to the documentation directory:
    ```bash
    cd docs
+   ```
+2. Start the local preview:
+   ```bash
    mint dev
    ```
-3. To validate the configuration and check for broken links prior to shipping:
+3. To validate the configuration and check for broken links:
    ```bash
    mint validate
    mint broken-links

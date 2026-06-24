@@ -18,37 +18,67 @@
   "navigation": {
     "groups": [
       {
-        "group": "Getting Started",
-        "icon": "flag-triangle-right",
+        "group": "0. Getting Started",
+        "icon": "flag",
         "expanded": true,
         "pages": [
-          "index",
-          "getting-started"
+          "index"
         ]
       },
       {
-        "group": "Architecture & Design",
+        "group": "1. The Patterns",
         "icon": "layers",
         "expanded": true,
         "pages": [
-          "architecture",
-          "persistence"
+          "theory/ddd",
+          "theory/cqrs",
+          "theory/state-changes",
+          "theory/queries",
+          "theory/event-sourcing"
         ]
       },
       {
-        "group": "Features & Guides",
+        "group": "2. Domain Modeling (Tutorial)",
         "icon": "book-open",
         "expanded": true,
         "pages": [
-          "projections",
-          "testing"
+          "tutorial/commands",
+          "tutorial/events",
+          "tutorial/errors",
+          "tutorial/aggregate"
+        ]
+      },
+      {
+        "group": "3. Domain Tests",
+        "icon": "vial",
+        "expanded": true,
+        "pages": [
+          "testing/complex-logic"
+        ]
+      },
+      {
+        "group": "4. Configuring an Application",
+        "icon": "wrench",
+        "expanded": true,
+        "pages": [
+          "config-app/event-store",
+          "config-app/simple-query",
+          "config-app/assembly"
+        ]
+      },
+      {
+        "group": "5. Building an Application",
+        "icon": "database",
+        "expanded": true,
+        "pages": [
+          "production/persisted-store",
+          "production/persisted-views",
+          "production/metadata",
+          "production/upcasters",
+          "production/axum-integration"
         ]
       }
     ]
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
   },
   "navbar": {
     "links": []
