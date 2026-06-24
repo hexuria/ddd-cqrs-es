@@ -48,3 +48,65 @@ Your projection code must handle processing the same event multiple times withou
 Events must be processed in the exact order they were committed. Processing events out of order can lead to corrupted read states (such as attempting to apply `MoneyDeposited` before `AccountOpened`).
 
 Our Projection Runner guarantees sequential processing by executing in a single thread per projection pipeline, reading events ordered strictly by their global database `sequence`.
+
+---
+
+## Building a Persisted Projection Runner
+
+To run a persisted projection in production, you can use the built-in `PersistedProjectionRunner` (for synchronous event stores) or `AsyncPersistedProjectionRunner` (for async event stores), paired with a checkpoint store (such as `SqliteCheckpointStore` or `PostgresCheckpointStore`).
+
+### Example: Sync Sqlite Projection Runner
+
+```rust
+use ddd_cqrs_es::{
+    SqliteEventStore, SqliteCheckpointStore, PersistedProjectionRunner,
+};
+
+fn run_my_projection(
+    event_store: &SqliteEventStore<BankAccount>,
+    connection: rusqlite::Connection,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Set up the checkpoint store database tables
+    let checkpoint_store = SqliteCheckpointStore::new(connection)?;
+    checkpoint_store.initialize_schema()?;
+
+    // 2. Wrap your custom projection with the runner
+    let mut runner = PersistedProjectionRunner::new(
+        MyBankAccountProjection::new(),
+        checkpoint_store,
+    );
+
+    // 3. Trigger a projection poll run
+    // This loads events after the stored checkpoint, processes them, 
+    // and advances the checkpoint atomically per event sequence.
+    let processed_count = runner.run(event_store)?;
+    println!("Processed {} new events", processed_count);
+
+    Ok(())
+}
+```
+
+### Example: Async Postgres Projection Runner
+
+```rust
+use ddd_cqrs_es::{
+    PostgresEventStore, PostgresCheckpointStore, AsyncPersistedProjectionRunner,
+};
+
+async fn run_my_async_projection(
+    event_store: &PostgresEventStore<BankAccount>,
+    checkpoint_store: PostgresCheckpointStore,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut runner = AsyncPersistedProjectionRunner::new(
+        MyBankAccountProjection::new(),
+        checkpoint_store,
+    );
+
+    // Trigger an async projection poll run
+    let processed_count = runner.run(event_store).await?;
+    println!("Processed {} new events in async background thread", processed_count);
+
+    Ok(())
+}
+```
+

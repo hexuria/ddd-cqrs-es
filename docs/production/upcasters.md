@@ -69,6 +69,22 @@ impl EventUpcaster for AccountOpenedUpcaster {
 
 ---
 
+## Registering Upcasters
+
+Once you have defined your `EventUpcaster`, you must register it with your `EventStore` adapter (such as `SqliteEventStore` or `PostgresEventStore`). The store's deserialization loop will automatically query the registered upcasters and apply them sequentially if it loads an event matching the registered event type name and source version.
+
+```rust
+// Create your event store
+let store = SqliteEventStore::<BankAccount>::new(connection)?;
+
+// Register the upcaster for the "account_opened" event type
+store.register_upcaster("account_opened", AccountOpenedUpcaster);
+```
+
+If multiple upcasters are registered for the same event type (e.g., `v1 -> v2` and `v2 -> v3`), the engine automatically constructs an upcaster chain and applies them sequentially when replaying events.
+
+---
+
 ## Upcasting Design Guidelines
 
 To manage schema changes cleanly as your product grows:
