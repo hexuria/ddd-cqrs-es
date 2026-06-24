@@ -266,3 +266,21 @@ where
         }
     }
 }
+
+#[cfg(feature = "async")]
+#[async_trait::async_trait]
+impl<A> crate::async_api::AsyncSnapshotStore<A> for InMemorySnapshotStore<A>
+where
+    A: Aggregate + Clone + Send + Sync + 'static,
+{
+    type Error = InMemorySnapshotError;
+
+    async fn load_snapshot(&self, aggregate_id: &A::Id) -> Result<Option<Snapshot<A>>, Self::Error> {
+        SnapshotStore::load_snapshot(self, aggregate_id)
+    }
+
+    async fn save_snapshot(&self, snapshot: Snapshot<A>) -> Result<(), Self::Error> {
+        SnapshotStore::save_snapshot(self, snapshot)
+    }
+}
+

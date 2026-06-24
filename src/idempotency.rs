@@ -209,3 +209,21 @@ where
         }
     }
 }
+
+#[cfg(feature = "async")]
+#[async_trait::async_trait]
+impl<V> crate::async_api::AsyncIdempotencyStore<V> for InMemoryIdempotencyStore<V>
+where
+    V: Clone + Send + Sync + 'static,
+{
+    type Error = InMemoryIdempotencyError;
+
+    async fn load(&self, key: &IdempotencyKey) -> Result<Option<V>, Self::Error> {
+        IdempotencyStore::load(self, key)
+    }
+
+    async fn save(&self, key: IdempotencyKey, value: V) -> Result<(), Self::Error> {
+        IdempotencyStore::save(self, key, value)
+    }
+}
+

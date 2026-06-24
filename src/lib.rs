@@ -115,8 +115,9 @@ pub use aggregate::{Aggregate, LoadedAggregate};
 #[cfg(feature = "async")]
 pub use async_api::{
     AsyncCommandBus, AsyncCommandHandler, AsyncEventStore, AsyncQueryHandler, AsyncRepository,
-    AsyncRepositoryResult,
+    AsyncRepositoryResult, AsyncSnapshotStore, AsyncIdempotencyStore,
 };
+
 pub use command::{CommandBus, CommandHandler, QueryHandler};
 pub use error::{ConcurrencyError, EventStoreError, EventStoreFailure, RepositoryError};
 pub use event::{

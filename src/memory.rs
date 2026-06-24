@@ -222,3 +222,30 @@ where
             .collect())
     }
 }
+
+#[cfg(feature = "async")]
+#[async_trait::async_trait]
+impl<A> crate::async_api::AsyncEventStore<A> for InMemoryEventStore<A>
+where
+    A: Aggregate + Send + Sync + 'static,
+{
+    type Error = EventStoreError;
+
+    async fn load(&self, aggregate_id: &A::Id) -> Result<EventStream<A>, Self::Error> {
+        EventStore::load(self, aggregate_id)
+    }
+
+    async fn append(
+        &self,
+        aggregate_id: &A::Id,
+        expected_revision: ExpectedRevision,
+        events: Vec<NewEvent<A::Event>>,
+    ) -> Result<EventStream<A>, Self::Error> {
+        EventStore::append(self, aggregate_id, expected_revision, events)
+    }
+
+    async fn load_global_after(&self, sequence: Option<u64>) -> Result<EventStream<A>, Self::Error> {
+        EventStore::load_global_after(self, sequence)
+    }
+}
+

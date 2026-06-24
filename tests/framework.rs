@@ -518,3 +518,105 @@ fn repository_returns_previous_result_for_idempotent_retry() {
     assert_eq!(first, retry);
     assert_eq!(store.load(&counter_id).unwrap().len(), 1);
 }
+
+#[cfg(feature = "async")]
+mod async_tests {
+    use super::*;
+    use ddd_cqrs_es::{
+        async_api::AsyncEventStore, AsyncRepository, AsyncSnapshotStore,
+        InMemoryEventStore, InMemoryIdempotencyStore, InMemorySnapshotStore, Snapshot,
+    };
+
+    #[tokio::test]
+    async fn test_async_repository_flow() {
+        let store = InMemoryEventStore::<Counter>::new();
+        let repo = AsyncRepository::new(store);
+        let counter_id = "async-counter-1".to_owned();
+
+        repo.execute(&counter_id, CounterCommand::Create, Metadata::default())
+            .await
+            .unwrap();
+
+        repo.execute(
+            &counter_id,
+            CounterCommand::Increment { by: 5 },
+            Metadata::default(),
+        )
+        .await
+        .unwrap();
+
+        let loaded = repo.load(&counter_id).await.unwrap();
+        assert_eq!(loaded.state.value, 5);
+        assert_eq!(loaded.revision, 2);
+    }
+
+    #[tokio::test]
+    async fn test_async_repository_with_snapshots() {
+        let store = InMemoryEventStore::<Counter>::new();
+        let snapshots = InMemorySnapshotStore::<Counter>::new();
+        let repo = AsyncRepository::new(store);
+        let counter_id = "async-counter-snapshot".to_owned();
+
+        repo.execute(&counter_id, CounterCommand::Create, Metadata::default())
+            .await
+            .unwrap();
+
+        let loaded = repo.load(&counter_id).await.unwrap();
+
+        let snapshot = Snapshot::new(
+            counter_id.clone(),
+            loaded.revision,
+            loaded.state.clone(),
+            Metadata::default(),
+        );
+        AsyncSnapshotStore::save_snapshot(&snapshots, snapshot).await.unwrap();
+
+        repo.execute(
+            &counter_id,
+            CounterCommand::Increment { by: 10 },
+            Metadata::default(),
+        )
+        .await
+        .unwrap();
+
+        let loaded_snap = repo.load_with_snapshot(&counter_id, &snapshots).await.unwrap();
+        assert_eq!(loaded_snap.state.value, 10);
+        assert_eq!(loaded_snap.revision, 2);
+    }
+
+    #[tokio::test]
+    async fn test_async_repository_idempotent() {
+        let store = InMemoryEventStore::<Counter>::new();
+        let idempotency = InMemoryIdempotencyStore::new();
+        let repo = AsyncRepository::new(store.clone());
+        let counter_id = "async-counter-idempotent".to_owned();
+        let key = IdempotencyKey::new("async-req-1");
+
+        let first = repo
+            .execute_idempotent(
+                &counter_id,
+                CounterCommand::Create,
+                Metadata::default(),
+                key.clone(),
+                &idempotency,
+            )
+            .await
+            .unwrap();
+
+        let retry = repo
+            .execute_idempotent(
+                &counter_id,
+                CounterCommand::Increment { by: 9 },
+                Metadata::default(),
+                key,
+                &idempotency,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first, retry);
+        let events = AsyncEventStore::load(&store, &counter_id).await.unwrap();
+        assert_eq!(events.len(), 1);
+    }
+}
+
