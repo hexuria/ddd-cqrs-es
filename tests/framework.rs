@@ -1,16 +1,27 @@
 use ddd_cqrs_es::{
-    Aggregate, AggregateFixture, ConcurrencyError, EventStore, EventStoreError, ExpectedRevision,
-    InMemoryEventStore, InMemoryProjectionRunner, Metadata, NewEvent, Projection, Repository,
-    RepositoryError,
+    assert_event_store_contract, Aggregate, AggregateFixture, ConcurrencyError, DomainEvent,
+    EventStore, EventStoreError, ExpectedRevision, IdempotencyKey, InMemoryEventStore,
+    InMemoryIdempotencyStore, InMemoryProjectionRunner, InMemorySnapshotStore, Metadata, NewEvent,
+    Projection, Repository, RepositoryError, Snapshot, SnapshotStore,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CounterEvent {
     Created,
     Incremented { by: u64 },
+}
+
+impl DomainEvent for CounterEvent {
+    fn event_type(&self) -> &'static str {
+        match self {
+            CounterEvent::Created => "counter_created",
+            CounterEvent::Incremented { .. } => "counter_incremented",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -147,6 +158,16 @@ fn event_store_rejects_wrong_expected_revision() {
 }
 
 #[test]
+fn in_memory_store_passes_reusable_contract() {
+    assert_event_store_contract::<Counter, _>(
+        InMemoryEventStore::<Counter>::new(),
+        "contract-counter".to_owned(),
+        CounterEvent::Created,
+        CounterEvent::Incremented { by: 1 },
+    );
+}
+
+#[test]
 fn domain_errors_are_not_persisted() {
     let store = InMemoryEventStore::<Counter>::new();
     let repo = Repository::new(store.clone());
@@ -179,12 +200,76 @@ fn metadata_and_global_sequence_are_preserved() {
 
     assert_eq!(committed[0].sequence, Some(1));
     assert_eq!(committed[0].revision, 1);
+    assert_eq!(committed[0].event_type, "counter_created");
     assert_eq!(committed[0].metadata, metadata);
     assert_eq!(committed[0].aggregate_type, "counter");
 
     let global = store.load_global_after(None).unwrap();
     assert_eq!(global.len(), 1);
     assert_eq!(global[0].sequence, Some(1));
+}
+
+#[cfg(feature = "uuid")]
+#[test]
+fn event_ids_use_uuid_when_feature_is_enabled() {
+    let store = InMemoryEventStore::<Counter>::new();
+    let repo = Repository::new(store);
+    let counter_id = "counter-1".to_owned();
+
+    let committed = repo
+        .execute(&counter_id, CounterCommand::Create, Metadata::default())
+        .unwrap();
+
+    assert!(uuid::Uuid::parse_str(committed[0].event_id.as_str()).is_ok());
+}
+
+#[cfg(feature = "json")]
+#[test]
+fn event_envelopes_round_trip_through_json() {
+    let store = InMemoryEventStore::<Counter>::new();
+    let repo = Repository::new(store);
+    let counter_id = "counter-1".to_owned();
+
+    let committed = repo
+        .execute(&counter_id, CounterCommand::Create, Metadata::default())
+        .unwrap();
+    let json = committed[0].to_json().unwrap();
+    let restored = ddd_cqrs_es::EventEnvelope::<CounterEvent, String>::from_json(&json).unwrap();
+
+    assert_eq!(restored, committed[0]);
+}
+
+#[test]
+fn repository_surfaces_concurrency_on_main_api() {
+    let store = InMemoryEventStore::<Counter>::new();
+    let repo = Repository::new(store.clone());
+    let counter_id = "counter-1".to_owned();
+    let stale = repo.load(&counter_id).unwrap();
+
+    store
+        .append(
+            &counter_id,
+            ExpectedRevision::Any,
+            vec![NewEvent::new(CounterEvent::Created, Metadata::default())],
+        )
+        .unwrap();
+
+    let error = repo
+        .save(
+            &counter_id,
+            &stale,
+            vec![CounterEvent::Incremented { by: 1 }],
+            Metadata::default(),
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RepositoryError::Concurrency(ConcurrencyError::WrongExpectedRevision {
+            expected: ExpectedRevision::Exact(0),
+            actual: 1,
+        })
+    ));
 }
 
 #[test]
@@ -259,9 +344,17 @@ fn aggregate_fixture_asserts_events_errors_state_and_revision() {
 
     AggregateFixture::<Counter>::new()
         .given(vec![CounterEvent::Created])
+        .when(CounterCommand::Increment { by: 2 })
+        .then_expect_events(vec![CounterEvent::Incremented { by: 2 }])
+        .then_expect_state(|counter| {
+            assert_eq!(counter.value, 2);
+            assert_eq!(counter.revision(), 2);
+        });
+
+    AggregateFixture::<Counter>::new()
+        .given(vec![CounterEvent::Created])
         .when(CounterCommand::Increment { by: 0 })
-        .then_expect_error(CounterError::InvalidIncrement)
-        .then_expect_state(|counter| assert_eq!(counter.revision(), 1));
+        .then_expect_error(CounterError::InvalidIncrement);
 }
 
 #[derive(Default)]
@@ -312,4 +405,73 @@ fn projection_runner_resumes_from_checkpoint() {
     assert_eq!(runner.run::<Counter, _>(&store).unwrap(), 1);
     assert_eq!(runner.checkpoint(), Some(2));
     assert_eq!(runner.projection().values[&counter_id], 4);
+}
+
+#[test]
+fn repository_loads_from_snapshot_and_replays_later_events() {
+    let store = InMemoryEventStore::<Counter>::new();
+    let snapshots = InMemorySnapshotStore::<Counter>::new();
+    let repo = Repository::new(store.clone());
+    let counter_id = "counter-1".to_owned();
+
+    repo.execute(&counter_id, CounterCommand::Create, Metadata::default())
+        .unwrap();
+    repo.execute(
+        &counter_id,
+        CounterCommand::Increment { by: 2 },
+        Metadata::default(),
+    )
+    .unwrap();
+
+    let loaded = repo.load(&counter_id).unwrap();
+    snapshots
+        .save_snapshot(Snapshot::new(
+            counter_id.clone(),
+            loaded.revision,
+            loaded.state,
+            Metadata::default(),
+        ))
+        .unwrap();
+
+    repo.execute(
+        &counter_id,
+        CounterCommand::Increment { by: 3 },
+        Metadata::default(),
+    )
+    .unwrap();
+
+    let loaded = repo.load_with_snapshot(&counter_id, &snapshots).unwrap();
+    assert_eq!(loaded.state.value, 5);
+    assert_eq!(loaded.revision, 3);
+}
+
+#[test]
+fn repository_returns_previous_result_for_idempotent_retry() {
+    let store = InMemoryEventStore::<Counter>::new();
+    let idempotency = InMemoryIdempotencyStore::new();
+    let repo = Repository::new(store.clone());
+    let counter_id = "counter-1".to_owned();
+    let key = IdempotencyKey::new("request-1");
+
+    let first = repo
+        .execute_idempotent(
+            &counter_id,
+            CounterCommand::Create,
+            Metadata::default(),
+            key.clone(),
+            &idempotency,
+        )
+        .unwrap();
+    let retry = repo
+        .execute_idempotent(
+            &counter_id,
+            CounterCommand::Increment { by: 9 },
+            Metadata::default(),
+            key,
+            &idempotency,
+        )
+        .unwrap();
+
+    assert_eq!(first, retry);
+    assert_eq!(store.load(&counter_id).unwrap().len(), 1);
 }

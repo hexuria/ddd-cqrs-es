@@ -1,8 +1,10 @@
 use crate::metadata::Metadata;
-use std::any::type_name;
 use std::fmt::{Display, Formatter};
+#[cfg(not(feature = "uuid"))]
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
+#[cfg(not(feature = "uuid"))]
+use std::time::UNIX_EPOCH;
 
 /// The current stream revision of an aggregate.
 ///
@@ -13,27 +15,49 @@ pub type Revision = u64;
 /// The revision of an aggregate stream with no persisted events.
 pub const INITIAL_REVISION: Revision = 0;
 
+/// Stable event type name stored with an event envelope.
+pub type EventType = String;
+
 /// A unique identifier assigned to a persisted event.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(transparent))]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EventId(String);
 
 impl EventId {
-    /// Creates a process-local unique event identifier.
+    /// Creates a unique event identifier.
+    ///
+    /// With the `uuid` feature enabled, this uses UUID v4. Without that
+    /// feature it falls back to a process-local identifier suitable for tests.
     pub fn new() -> Self {
-        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        #[cfg(feature = "uuid")]
+        {
+            Self(uuid::Uuid::new_v4().to_string())
+        }
 
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default();
-        let next = COUNTER.fetch_add(1, Ordering::Relaxed);
+        #[cfg(not(feature = "uuid"))]
+        {
+            static COUNTER: AtomicU64 = AtomicU64::new(1);
 
-        Self(format!("evt-{nanos:x}-{next:x}"))
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            let next = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+            Self(format!("evt-{nanos:x}-{next:x}"))
+        }
     }
 
     /// Creates an event identifier from an existing stable value.
     pub fn from_string(value: impl Into<String>) -> Self {
         Self(value.into())
+    }
+
+    /// Creates an event identifier from a UUID.
+    #[cfg(feature = "uuid")]
+    pub fn from_uuid(value: uuid::Uuid) -> Self {
+        Self(value.to_string())
     }
 
     /// Returns the identifier as a string slice.
@@ -54,7 +78,22 @@ impl Display for EventId {
     }
 }
 
+/// Domain event metadata supplied by the event payload.
+///
+/// Implement this for event enums so stored envelopes use stable event names
+/// and schema versions instead of Rust type paths.
+pub trait DomainEvent: Clone + Send + Sync + 'static {
+    /// Stable event type name, such as `account_opened`.
+    fn event_type(&self) -> &'static str;
+
+    /// Event schema version. Increment when the payload schema changes.
+    fn event_version(&self) -> u32 {
+        1
+    }
+}
+
 /// Concurrency expectation used when appending events.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExpectedRevision {
     /// Append without checking the current stream revision.
@@ -66,12 +105,13 @@ pub enum ExpectedRevision {
 }
 
 /// A domain event before persistence assigns revision and sequence values.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewEvent<E> {
     /// Event payload supplied by aggregate command handling.
     pub payload: E,
     /// Stable event type name used by storage adapters and projections.
-    pub event_type: String,
+    pub event_type: EventType,
     /// Schema version for manual migrations and future upcasting support.
     pub event_version: u32,
     /// Audit, tracing, tenancy, and causality metadata.
@@ -79,15 +119,26 @@ pub struct NewEvent<E> {
 }
 
 impl<E> NewEvent<E> {
-    /// Creates a new event using the Rust payload type name as event type.
-    ///
-    /// Production applications should prefer [`Self::with_type`] with an
-    /// explicit stable name.
-    pub fn new(payload: E, metadata: Metadata) -> Self {
+    /// Creates a new event using stable metadata from [`DomainEvent`].
+    pub fn new(payload: E, metadata: Metadata) -> Self
+    where
+        E: DomainEvent,
+    {
+        Self::from_domain_event(payload, metadata)
+    }
+
+    /// Creates a new event using stable metadata from [`DomainEvent`].
+    pub fn from_domain_event(payload: E, metadata: Metadata) -> Self
+    where
+        E: DomainEvent,
+    {
+        let event_type = payload.event_type().to_owned();
+        let event_version = payload.event_version();
+
         Self {
             payload,
-            event_type: type_name::<E>().to_owned(),
-            event_version: 1,
+            event_type,
+            event_version,
             metadata,
         }
     }
@@ -110,6 +161,7 @@ impl<E> NewEvent<E> {
 }
 
 /// A persisted event with stream identity, revision, metadata, and timestamps.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventEnvelope<E, Id> {
     /// Unique event identifier.
@@ -123,7 +175,7 @@ pub struct EventEnvelope<E, Id> {
     /// Global append order assigned by stores that support sequencing.
     pub sequence: Option<u64>,
     /// Stable event type name.
-    pub event_type: String,
+    pub event_type: EventType,
     /// Event schema version.
     pub event_version: u32,
     /// Domain event payload.
@@ -182,5 +234,33 @@ impl<E, Id> EventEnvelope<E, Id> {
             metadata: self.metadata,
             recorded_at: self.recorded_at,
         }
+    }
+
+    /// Returns the recording time as a chrono UTC timestamp.
+    #[cfg(feature = "chrono")]
+    pub fn recorded_at_utc(&self) -> chrono::DateTime<chrono::Utc> {
+        self.recorded_at.into()
+    }
+
+    /// Serializes this envelope as JSON.
+    #[cfg(feature = "json")]
+    pub fn to_json(&self) -> Result<String, crate::error::EventStoreError>
+    where
+        E: serde::Serialize,
+        Id: serde::Serialize,
+    {
+        serde_json::to_string(self)
+            .map_err(|error| crate::error::EventStoreError::Serialization(error.to_string()))
+    }
+
+    /// Deserializes an envelope from JSON.
+    #[cfg(feature = "json")]
+    pub fn from_json(json: &str) -> Result<Self, crate::error::EventStoreError>
+    where
+        E: serde::de::DeserializeOwned,
+        Id: serde::de::DeserializeOwned,
+    {
+        serde_json::from_str(json)
+            .map_err(|error| crate::error::EventStoreError::Deserialization(error.to_string()))
     }
 }

@@ -1,4 +1,4 @@
-use ddd_cqrs_es::{Aggregate, InMemoryEventStore, Metadata, Repository};
+use ddd_cqrs_es::{Aggregate, DomainEvent, InMemoryEventStore, Metadata, Repository};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AccountEvent {
@@ -13,6 +13,17 @@ enum AccountEvent {
         amount: i64,
     },
     AccountClosed,
+}
+
+impl DomainEvent for AccountEvent {
+    fn event_type(&self) -> &'static str {
+        match self {
+            AccountEvent::AccountOpened { .. } => "account_opened",
+            AccountEvent::MoneyDeposited { .. } => "money_deposited",
+            AccountEvent::MoneyWithdrawn { .. } => "money_withdrawn",
+            AccountEvent::AccountClosed => "account_closed",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

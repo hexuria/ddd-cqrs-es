@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 ///
 /// The fields support tracing, auditability, multi-tenancy, and event
 /// causality without requiring a specific observability crate.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Metadata {
     /// Correlates all work belonging to the same business request.

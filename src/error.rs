@@ -3,6 +3,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 /// Optimistic concurrency failure.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConcurrencyError {
     /// The append expected an empty stream, but events already exist.
@@ -34,6 +35,7 @@ impl Display for ConcurrencyError {
 impl Error for ConcurrencyError {}
 
 /// Errors produced by event store implementations.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EventStoreError {
     /// Optimistic concurrency check failed.
@@ -50,6 +52,27 @@ pub enum EventStoreError {
     Backend(String),
     /// Unknown adapter failure.
     Unknown(String),
+}
+
+/// Classifies store errors for repository-level error mapping.
+///
+/// Custom event stores can implement this trait to surface concurrency failures
+/// as [`RepositoryError::Concurrency`] while preserving all other errors as
+/// [`RepositoryError::Store`].
+pub trait EventStoreFailure: Sized {
+    /// Converts a store error into a repository error.
+    fn into_repository_error<DomainError>(self) -> RepositoryError<DomainError, Self> {
+        RepositoryError::Store(self)
+    }
+}
+
+impl EventStoreFailure for EventStoreError {
+    fn into_repository_error<DomainError>(self) -> RepositoryError<DomainError, Self> {
+        match self {
+            EventStoreError::Concurrency(error) => RepositoryError::Concurrency(error),
+            error => RepositoryError::Store(error),
+        }
+    }
 }
 
 impl Display for EventStoreError {

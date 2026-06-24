@@ -5,6 +5,7 @@ A lightweight Rust framework for Domain-Driven Design, CQRS, and Event Sourcing.
 The crate gives you explicit, infrastructure-light building blocks:
 
 - `Aggregate`: typed domain consistency boundary
+- `DomainEvent`: stable event type/version metadata
 - `EventEnvelope`: persisted event metadata, revision, and global sequence
 - `Metadata`: audit, tracing, causality, and tenancy context
 - `EventStore`: pluggable persistence abstraction
@@ -37,12 +38,21 @@ ddd_cqrs_es = { path = "../ddd_cqrs_es" }
 ## Example
 
 ```rust
-use ddd_cqrs_es::{Aggregate, InMemoryEventStore, Metadata, Repository};
+use ddd_cqrs_es::{Aggregate, DomainEvent, InMemoryEventStore, Metadata, Repository};
 
 #[derive(Clone)]
 enum CounterEvent {
     Created,
     Incremented(u64),
+}
+
+impl DomainEvent for CounterEvent {
+    fn event_type(&self) -> &'static str {
+        match self {
+            CounterEvent::Created => "counter_created",
+            CounterEvent::Incremented(_) => "counter_incremented",
+        }
+    }
 }
 
 enum CounterCommand {

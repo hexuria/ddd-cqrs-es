@@ -3,11 +3,17 @@
 Implement an aggregate by defining commands, events, state, and domain errors.
 
 ```rust
-use ddd_cqrs_es::{Aggregate, InMemoryEventStore, Metadata, Repository};
+use ddd_cqrs_es::{Aggregate, DomainEvent, InMemoryEventStore, Metadata, Repository};
 
 #[derive(Clone)]
 enum AccountEvent {
     Opened { account_id: String },
+}
+
+impl DomainEvent for AccountEvent {
+    fn event_type(&self) -> &'static str {
+        "account_opened"
+    }
 }
 
 enum AccountCommand {

@@ -1,4 +1,4 @@
-use crate::event::{EventEnvelope, Revision, INITIAL_REVISION};
+use crate::event::{DomainEvent, EventEnvelope, Revision, INITIAL_REVISION};
 use std::hash::Hash;
 
 /// Event-sourced domain consistency boundary.
@@ -12,7 +12,7 @@ pub trait Aggregate: Sized {
     /// Command type handled by this aggregate.
     type Command;
     /// Domain event type applied by this aggregate.
-    type Event: Clone + Send + Sync + 'static;
+    type Event: DomainEvent;
     /// Domain error type returned when a command is rejected.
     type Error;
 

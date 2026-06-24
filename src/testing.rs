@@ -1,4 +1,8 @@
 use crate::aggregate::Aggregate;
+use crate::error::{ConcurrencyError, EventStoreError};
+use crate::event::{ExpectedRevision, NewEvent};
+use crate::event_store::EventStore;
+use crate::metadata::Metadata;
 use std::fmt::Debug;
 
 /// Fluent aggregate test fixture.
@@ -11,6 +15,69 @@ where
     A: Aggregate,
 {
     given: Vec<A::Event>,
+}
+
+/// Runs the common event-store contract against a store implementation.
+///
+/// Adapter crates can call this from their own integration tests to verify
+/// stream loading, optimistic concurrency, metadata preservation, revision
+/// assignment, and global sequencing.
+pub fn assert_event_store_contract<A, S>(
+    store: S,
+    aggregate_id: A::Id,
+    first_event: A::Event,
+    second_event: A::Event,
+) where
+    A: Aggregate,
+    A::Event: PartialEq + Debug,
+    S: EventStore<A, Error = EventStoreError>,
+{
+    assert!(store.load(&aggregate_id).unwrap().is_empty());
+
+    let first_metadata = Metadata::new().with_correlation_id("contract-1");
+    let first = store
+        .append(
+            &aggregate_id,
+            ExpectedRevision::NoStream,
+            vec![NewEvent::new(first_event.clone(), first_metadata.clone())],
+        )
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].revision, 1);
+    assert_eq!(first[0].sequence, Some(1));
+    assert_eq!(first[0].metadata, first_metadata);
+
+    let duplicate = store.append(
+        &aggregate_id,
+        ExpectedRevision::NoStream,
+        vec![NewEvent::new(second_event.clone(), Metadata::default())],
+    );
+    let Err(duplicate) = duplicate else {
+        panic!("expected NoStream append to fail after stream creation");
+    };
+    assert_eq!(
+        duplicate,
+        EventStoreError::Concurrency(ConcurrencyError::StreamAlreadyExists)
+    );
+
+    let second = store
+        .append(
+            &aggregate_id,
+            ExpectedRevision::Exact(1),
+            vec![NewEvent::new(second_event.clone(), Metadata::default())],
+        )
+        .unwrap();
+    assert_eq!(second[0].revision, 2);
+    assert_eq!(second[0].sequence, Some(2));
+
+    let stream = store.load(&aggregate_id).unwrap();
+    assert_eq!(stream.len(), 2);
+    assert_eq!(stream[0].payload, first_event);
+    assert_eq!(stream[1].payload, second_event);
+
+    let global = store.load_global_after(Some(1)).unwrap();
+    assert_eq!(global.len(), 1);
+    assert_eq!(global[0].revision, 2);
 }
 
 impl<A> AggregateFixture<A>
@@ -102,9 +169,19 @@ where
         self
     }
 
-    /// Asserts against replayed aggregate state before the command.
-    pub fn then_expect_state(self, assertion: impl FnOnce(&A)) -> Self {
-        assertion(&self.state);
+    /// Asserts against aggregate state after successful command events apply.
+    pub fn then_expect_state(self, assertion: impl FnOnce(&A)) -> Self
+    where
+        A: Clone,
+        A::Error: Debug,
+    {
+        let events = self.result.as_ref().unwrap();
+        let mut state = self.state.clone();
+        for event in events {
+            state.apply(event);
+        }
+
+        assertion(&state);
         self
     }
 

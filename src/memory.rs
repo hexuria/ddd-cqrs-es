@@ -139,6 +139,10 @@ where
             }
         }
 
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let mut stream_events = Vec::with_capacity(events.len());
         for new_event in events {
             let sequence = state.next_sequence;

@@ -1,10 +1,16 @@
 use crate::aggregate::Aggregate;
+use crate::error::{ConcurrencyError, EventStoreFailure, RepositoryError};
 use crate::metadata::Metadata;
+use std::collections::HashMap;
+use std::error::Error;
+use std::fmt::{Display, Formatter};
+use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
 /// Persisted aggregate snapshot used to speed up replay of long streams.
 ///
 /// Snapshots are optional and must never replace the event log.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot<A>
 where
@@ -54,4 +60,146 @@ where
 
     /// Saves a snapshot.
     fn save_snapshot(&self, snapshot: Snapshot<A>) -> Result<(), Self::Error>;
+}
+
+/// Error returned by [`InMemorySnapshotStore`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InMemorySnapshotError {
+    /// Shared state was poisoned by a panic while holding a lock.
+    Poisoned,
+}
+
+impl Display for InMemorySnapshotError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InMemorySnapshotError::Poisoned => f.write_str("snapshot store lock was poisoned"),
+        }
+    }
+}
+
+impl Error for InMemorySnapshotError {}
+
+/// Thread-safe in-memory snapshot store.
+#[derive(Clone, Debug)]
+pub struct InMemorySnapshotStore<A>
+where
+    A: Aggregate + Clone,
+{
+    snapshots: Arc<RwLock<HashMap<A::Id, Snapshot<A>>>>,
+}
+
+impl<A> Default for InMemorySnapshotStore<A>
+where
+    A: Aggregate + Clone,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<A> InMemorySnapshotStore<A>
+where
+    A: Aggregate + Clone,
+{
+    /// Creates an empty in-memory snapshot store.
+    pub fn new() -> Self {
+        Self {
+            snapshots: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Removes all snapshots.
+    pub fn clear(&self) -> Result<(), InMemorySnapshotError> {
+        self.snapshots
+            .write()
+            .map_err(|_| InMemorySnapshotError::Poisoned)?
+            .clear();
+        Ok(())
+    }
+}
+
+impl<A> SnapshotStore<A> for InMemorySnapshotStore<A>
+where
+    A: Aggregate + Clone + Send + Sync + 'static,
+{
+    type Error = InMemorySnapshotError;
+
+    fn load_snapshot(&self, aggregate_id: &A::Id) -> Result<Option<Snapshot<A>>, Self::Error> {
+        let snapshots = self
+            .snapshots
+            .read()
+            .map_err(|_| InMemorySnapshotError::Poisoned)?;
+        Ok(snapshots.get(aggregate_id).cloned())
+    }
+
+    fn save_snapshot(&self, snapshot: Snapshot<A>) -> Result<(), Self::Error> {
+        let mut snapshots = self
+            .snapshots
+            .write()
+            .map_err(|_| InMemorySnapshotError::Poisoned)?;
+        snapshots.insert(snapshot.aggregate_id.clone(), snapshot);
+        Ok(())
+    }
+}
+
+/// Error returned by snapshot-aware repository operations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SnapshotRepositoryError<DomainError, StoreError, SnapshotError> {
+    /// Aggregate command handling rejected the command.
+    Domain(DomainError),
+    /// Event store rejected the append due to optimistic concurrency.
+    Concurrency(ConcurrencyError),
+    /// Event store or infrastructure operation failed.
+    Store(StoreError),
+    /// Snapshot store operation failed.
+    Snapshot(SnapshotError),
+}
+
+impl<DomainError, StoreError, SnapshotError>
+    SnapshotRepositoryError<DomainError, StoreError, SnapshotError>
+where
+    StoreError: EventStoreFailure,
+{
+    /// Converts an event store error into the snapshot-aware repository error.
+    pub fn from_store_error(error: StoreError) -> Self {
+        match error.into_repository_error() {
+            RepositoryError::Domain(error) => SnapshotRepositoryError::Domain(error),
+            RepositoryError::Concurrency(error) => SnapshotRepositoryError::Concurrency(error),
+            RepositoryError::Store(error) => SnapshotRepositoryError::Store(error),
+        }
+    }
+}
+
+impl<DomainError, StoreError, SnapshotError> Display
+    for SnapshotRepositoryError<DomainError, StoreError, SnapshotError>
+where
+    DomainError: Display,
+    StoreError: Display,
+    SnapshotError: Display,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SnapshotRepositoryError::Domain(error) => Display::fmt(error, f),
+            SnapshotRepositoryError::Concurrency(error) => Display::fmt(error, f),
+            SnapshotRepositoryError::Store(error) => Display::fmt(error, f),
+            SnapshotRepositoryError::Snapshot(error) => Display::fmt(error, f),
+        }
+    }
+}
+
+impl<DomainError, StoreError, SnapshotError> Error
+    for SnapshotRepositoryError<DomainError, StoreError, SnapshotError>
+where
+    DomainError: Error + 'static,
+    StoreError: Error + 'static,
+    SnapshotError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            SnapshotRepositoryError::Domain(error) => Some(error),
+            SnapshotRepositoryError::Concurrency(error) => Some(error),
+            SnapshotRepositoryError::Store(error) => Some(error),
+            SnapshotRepositoryError::Snapshot(error) => Some(error),
+        }
+    }
 }

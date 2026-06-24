@@ -15,13 +15,17 @@ Implemented in this version:
 - Process manager abstraction for event-to-command policies.
 - Snapshot model and snapshot store trait.
 - Aggregate fixture for unit testing domain behavior without storage.
+- Stable event type/version metadata through `DomainEvent`.
+- Feature-gated async traits and async repository.
+- Feature-gated serde/JSON envelope round trips.
+- UUID-backed event IDs when the `uuid` feature is enabled.
+- Event upcaster trait.
+- Idempotency key and in-memory idempotency store.
+- Snapshot-aware repository loading and execution.
+- Reusable event store contract helper for adapter tests.
 - Bank account example and integration tests.
 
 Deferred adapters and optional capabilities:
 
-- Async event store/repository APIs.
-- Serde/JSON envelope helpers.
 - PostgreSQL and SQLite durable stores.
-- Event upcasters.
 - Tracing middleware.
-- Idempotency storage.
