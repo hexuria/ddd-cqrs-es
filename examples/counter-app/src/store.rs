@@ -1632,7 +1632,36 @@ fn interpolate_query(sql: &str, params: &[serde_json::Value]) -> Result<String, 
     Ok(final_sql)
 }
 
-fn write_startup_message(stream: &mut std::net::TcpStream, user: &str, database: &str) -> std::io::Result<()> {
+enum PgStream {
+    Plain(std::net::TcpStream),
+    Tls(rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>),
+}
+
+impl std::io::Read for PgStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            PgStream::Plain(s) => s.read(buf),
+            PgStream::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl std::io::Write for PgStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            PgStream::Plain(s) => s.write(buf),
+            PgStream::Tls(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            PgStream::Plain(s) => s.flush(),
+            PgStream::Tls(s) => s.flush(),
+        }
+    }
+}
+
+fn write_startup_message(stream: &mut PgStream, user: &str, database: &str) -> std::io::Result<()> {
     use std::io::Write;
     let mut body = Vec::new();
     body.extend_from_slice(&0x00030000u32.to_be_bytes()); // Protocol v3.0
@@ -1654,7 +1683,7 @@ fn write_startup_message(stream: &mut std::net::TcpStream, user: &str, database:
     Ok(())
 }
 
-fn write_query_message(stream: &mut std::net::TcpStream, sql: &str) -> std::io::Result<()> {
+fn write_query_message(stream: &mut PgStream, sql: &str) -> std::io::Result<()> {
     use std::io::Write;
     let mut body = Vec::new();
     body.extend_from_slice(sql.as_bytes());
@@ -1668,11 +1697,60 @@ fn write_query_message(stream: &mut std::net::TcpStream, sql: &str) -> std::io::
     Ok(())
 }
 
-fn write_password_message(stream: &mut std::net::TcpStream, password: &str) -> std::io::Result<()> {
+fn write_password_message(stream: &mut PgStream, password: &str) -> std::io::Result<()> {
     use std::io::Write;
     let mut body = Vec::new();
     body.extend_from_slice(password.as_bytes());
     body.extend_from_slice(b"\0");
+    
+    let length = (body.len() + 4) as u32;
+    stream.write_all(&[b'p'])?;
+    stream.write_all(&length.to_be_bytes())?;
+    stream.write_all(&body)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn generate_client_nonce() -> String {
+    use std::time::SystemTime;
+    let seed = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(42) as u64;
+    
+    let mut rng = seed;
+    let chars = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut nonce = String::with_capacity(24);
+    for _ in 0..24 {
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let idx = (rng % chars.len() as u64) as usize;
+        nonce.push(chars[idx] as char);
+    }
+    nonce
+}
+
+fn write_sasl_initial_response(stream: &mut PgStream, mechanism: &str, initial_response: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut body = Vec::new();
+    body.extend_from_slice(mechanism.as_bytes());
+    body.push(0); // null terminator for mechanism string
+    
+    let data_len = initial_response.len() as i32;
+    body.extend_from_slice(&data_len.to_be_bytes());
+    body.extend_from_slice(initial_response);
+    
+    let length = (body.len() + 4) as u32;
+    stream.write_all(&[b'p'])?;
+    stream.write_all(&length.to_be_bytes())?;
+    stream.write_all(&body)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn write_sasl_response(stream: &mut PgStream, response: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut body = Vec::new();
+    body.extend_from_slice(response);
     
     let length = (body.len() + 4) as u32;
     stream.write_all(&[b'p'])?;
@@ -1687,7 +1765,7 @@ struct PgMessage {
     payload: Vec<u8>,
 }
 
-fn read_message(stream: &mut std::net::TcpStream) -> std::io::Result<PgMessage> {
+fn read_message(stream: &mut PgStream) -> std::io::Result<PgMessage> {
     use std::io::Read;
     let mut type_buf = [0u8; 1];
     stream.read_exact(&mut type_buf)?;
@@ -1850,7 +1928,49 @@ fn execute_raw_tcp_postgres(
     let mut stream = std::net::TcpStream::connect(&addr)
         .map_err(|e| format!("Failed to connect to Postgres at {}: {}", addr, e))?;
         
-    write_startup_message(&mut stream, &pg_params.user, &pg_params.database)
+    use std::io::{Read, Write};
+    
+    // Send SSLRequest first
+    let ssl_request = [0u8, 0, 0, 8, 4, 210, 22, 47];
+    stream.write_all(&ssl_request)
+        .map_err(|e| format!("Failed to send SSLRequest: {}", e))?;
+    stream.flush()
+        .map_err(|e| format!("Failed to flush SSLRequest: {}", e))?;
+
+    let mut ssl_response = [0u8; 1];
+    stream.read_exact(&mut ssl_response)
+        .map_err(|e| format!("Failed to read SSLRequest response: {}", e))?;
+
+    let mut pg_stream = if ssl_response[0] == b'S' {
+        // Initialize rustls-rustcrypto as the default provider if not already installed.
+        let _ = rustls_rustcrypto::provider().install_default();
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        let server_name = rustls::pki_types::ServerName::try_from(pg_params.host.as_str())
+            .map_err(|e| format!("Invalid server name '{}': {}", pg_params.host, e))?
+            .to_owned();
+
+        let conn = rustls::ClientConnection::new(std::sync::Arc::new(config), server_name)
+            .map_err(|e| format!("Failed to create rustls ClientConnection: {}", e))?;
+
+        let tls_stream = rustls::StreamOwned::new(conn, stream);
+        PgStream::Tls(tls_stream)
+    } else if ssl_response[0] == b'N' {
+        if url.contains("sslmode=require") {
+            return Err("Server rejected SSL request, but sslmode=require was requested".to_string());
+        }
+        PgStream::Plain(stream)
+    } else {
+        return Err(format!("Unexpected response to SSLRequest: {:?}", ssl_response[0] as char));
+    };
+        
+    write_startup_message(&mut pg_stream, &pg_params.user, &pg_params.database)
         .map_err(|e| format!("Failed to send startup message: {}", e))?;
         
     let mut columns = Vec::new();
@@ -1858,7 +1978,7 @@ fn execute_raw_tcp_postgres(
     let mut query_sent = false;
     
     loop {
-        let msg = read_message(&mut stream)
+        let msg = read_message(&mut pg_stream)
             .map_err(|e| format!("Failed to read message from Postgres: {}", e))?;
             
         match msg.msg_type {
@@ -1871,7 +1991,7 @@ fn execute_raw_tcp_postgres(
                     0 => {}
                     3 => {
                         let pwd = pg_params.password.as_deref().unwrap_or("");
-                        write_password_message(&mut stream, pwd)
+                        write_password_message(&mut pg_stream, pwd)
                             .map_err(|e| format!("Failed to send password message: {}", e))?;
                     }
                     5 => {
@@ -1887,8 +2007,140 @@ fn execute_raw_tcp_postgres(
                         hash2_input.extend_from_slice(salt);
                         let hash2 = format!("md5{:x}", md5::compute(&hash2_input));
                         
-                        write_password_message(&mut stream, &hash2)
+                        write_password_message(&mut pg_stream, &hash2)
                             .map_err(|e| format!("Failed to send MD5 password message: {}", e))?;
+                    }
+                    10 => {
+                        // SCRAM-SHA-256 Authentication
+                        let mut has_scram = false;
+                        let mut idx = 4;
+                        while idx < msg.payload.len() {
+                            let start = idx;
+                            while idx < msg.payload.len() && msg.payload[idx] != 0 {
+                                idx += 1;
+                            }
+                            if idx < msg.payload.len() {
+                                let mech = std::str::from_utf8(&msg.payload[start..idx]).unwrap_or("");
+                                if mech == "SCRAM-SHA-256" {
+                                    has_scram = true;
+                                    break;
+                                }
+                            }
+                            idx += 1; // skip null byte
+                        }
+                        
+                        if !has_scram {
+                            return Err("Server SASL mechanisms do not support SCRAM-SHA-256".to_string());
+                        }
+                        
+                        // 1. Generate client nonce
+                        let client_nonce = generate_client_nonce();
+                        let client_first_message_bare = format!("n={},r={}", pg_params.user, client_nonce);
+                        let client_first_message = format!("n,,{}", client_first_message_bare);
+                        
+                        // 2. Write SASLInitialResponse
+                        write_sasl_initial_response(&mut pg_stream, "SCRAM-SHA-256", client_first_message.as_bytes())
+                            .map_err(|e| format!("Failed to write SASLInitialResponse: {}", e))?;
+                        
+                        // 3. Read SASLContinue message (R / 11)
+                        let next_msg = read_message(&mut pg_stream)
+                            .map_err(|e| format!("Failed to read SASLContinue message: {}", e))?;
+                            
+                        if next_msg.msg_type == b'E' {
+                            let err_msg = parse_error_response(&next_msg.payload);
+                            return Err(format!("Postgres authentication failed: {}", err_msg));
+                        }
+                        if next_msg.msg_type != b'R' {
+                            return Err(format!("Expected AuthenticationRequest ('R') during SASL, got '{}'", next_msg.msg_type as char));
+                        }
+                        
+                        let next_auth_type = u32::from_be_bytes([next_msg.payload[0], next_msg.payload[1], next_msg.payload[2], next_msg.payload[3]]);
+                        if next_auth_type != 11 {
+                            return Err(format!("Expected SASLContinue (11), got {}", next_auth_type));
+                        }
+                        
+                        let server_first_message_str = std::str::from_utf8(&next_msg.payload[4..])
+                            .map_err(|e| format!("Invalid UTF-8 in SASLContinue payload: {}", e))?;
+                            
+                        let mut server_nonce = "";
+                        let mut salt_base64 = "";
+                        let mut iterations_str = "";
+
+                        for part in server_first_message_str.split(',') {
+                            if let Some(val) = part.strip_prefix("r=") {
+                                server_nonce = val;
+                            } else if let Some(val) = part.strip_prefix("s=") {
+                                salt_base64 = val;
+                            } else if let Some(val) = part.strip_prefix("i=") {
+                                iterations_str = val;
+                            }
+                        }
+                        
+                        if !server_nonce.starts_with(&client_nonce) {
+                            return Err("Server nonce does not match client nonce prefix".to_string());
+                        }
+                        
+                        use base64::Engine;
+                        let salt = base64::engine::general_purpose::STANDARD.decode(salt_base64)
+                            .map_err(|e| format!("Invalid salt base64: {}", e))?;
+                        let iterations = iterations_str.parse::<u32>()
+                            .map_err(|e| format!("Invalid iterations '{}': {}", iterations_str, e))?;
+                            
+                        // 4. Compute proof
+                        let client_final_message_without_proof = format!("c=biws,r={}", server_nonce);
+                        let auth_message = format!("{},{},{}", client_first_message_bare, server_first_message_str, client_final_message_without_proof);
+                        
+                        let mut salted_password = [0u8; 32];
+                        let _ = pbkdf2::pbkdf2::<hmac::Hmac<sha2::Sha256>>(
+                            pg_params.password.as_deref().unwrap_or("").as_bytes(),
+                            &salt,
+                            iterations,
+                            &mut salted_password,
+                        );
+                        
+                        use hmac::Mac;
+                        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(&salted_password)
+                            .map_err(|e| format!("Failed to create HMAC-SHA256 for Client Key: {}", e))?;
+                        mac.update(b"Client Key");
+                        let client_key = mac.finalize().into_bytes();
+                        
+                        use sha2::Digest;
+                        let mut hasher = sha2::Sha256::new();
+                        hasher.update(&client_key);
+                        let stored_key = hasher.finalize();
+                        
+                        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(&stored_key)
+                            .map_err(|e| format!("Failed to create HMAC-SHA256 for Client Signature: {}", e))?;
+                        mac.update(auth_message.as_bytes());
+                        let client_signature = mac.finalize().into_bytes();
+                        
+                        let mut client_proof = [0u8; 32];
+                        for i in 0..32 {
+                            client_proof[i] = client_key[i] ^ client_signature[i];
+                        }
+                        
+                        let client_final_message = format!("{},p={}", client_final_message_without_proof, base64::engine::general_purpose::STANDARD.encode(client_proof));
+                        
+                        // 5. Send SASLResponse
+                        write_sasl_response(&mut pg_stream, client_final_message.as_bytes())
+                            .map_err(|e| format!("Failed to write SASLResponse: {}", e))?;
+                            
+                        // 6. Read SASLFinal message (R / 12)
+                        let final_msg = read_message(&mut pg_stream)
+                            .map_err(|e| format!("Failed to read SASLFinal message: {}", e))?;
+                            
+                        if final_msg.msg_type == b'E' {
+                            let err_msg = parse_error_response(&final_msg.payload);
+                            return Err(format!("Postgres authentication failed at final stage: {}", err_msg));
+                        }
+                        if final_msg.msg_type != b'R' {
+                            return Err(format!("Expected AuthenticationRequest ('R') during SASL final, got '{}'", final_msg.msg_type as char));
+                        }
+                        
+                        let final_auth_type = u32::from_be_bytes([final_msg.payload[0], final_msg.payload[1], final_msg.payload[2], final_msg.payload[3]]);
+                        if final_auth_type != 12 {
+                            return Err(format!("Expected SASLFinal (12), got {}", final_auth_type));
+                        }
                     }
                     _ => {
                         return Err(format!("Unsupported PostgreSQL authentication type: {}", auth_type));
@@ -1902,7 +2154,7 @@ fn execute_raw_tcp_postgres(
             b'Z' => {
                 if !query_sent {
                     let interpolated = interpolate_query(sql, &params)?;
-                    write_query_message(&mut stream, &interpolated)
+                    write_query_message(&mut pg_stream, &interpolated)
                         .map_err(|e| format!("Failed to send query: {}", e))?;
                     query_sent = true;
                 } else {
@@ -1940,7 +2192,11 @@ async fn execute_postgres_query(
     #[cfg(runtime_wasmtime)]
     {
         if backend == "postgres" && (url.starts_with("postgres://") || url.starts_with("postgresql://")) {
-            return execute_raw_tcp_postgres(url, sql, params);
+            let res = execute_raw_tcp_postgres(url, sql, params);
+            if let Err(ref e) = res {
+                eprintln!("[SERVER ERROR] execute_raw_tcp_postgres failed: {}", e);
+            }
+            return res;
         }
     }
 
