@@ -1918,14 +1918,14 @@ fn parse_data_row(payload: &[u8], columns: &[PgColumn]) -> std::io::Result<serde
     Ok(serde_json::Value::Object(row_obj))
 }
 
-fn execute_raw_tcp_postgres(
+static PG_CONN: std::sync::Mutex<Option<(String, PgStream)>> = std::sync::Mutex::new(None);
+
+fn connect_and_auth_postgres(
     url: &str,
-    sql: &str,
-    params: Vec<serde_json::Value>,
-) -> Result<Vec<serde_json::Value>, String> {
-    let pg_params = parse_pg_url(url)?;
-    let addr = format!("{}:{}", pg_params.host, pg_params.port);
-    let mut stream = std::net::TcpStream::connect(&addr)
+    pg_params: &PgConnParams,
+    addr: &str,
+) -> Result<PgStream, String> {
+    let mut stream = std::net::TcpStream::connect(addr)
         .map_err(|e| format!("Failed to connect to Postgres at {}: {}", addr, e))?;
         
     use std::io::{Read, Write};
@@ -1942,7 +1942,6 @@ fn execute_raw_tcp_postgres(
         .map_err(|e| format!("Failed to read SSLRequest response: {}", e))?;
 
     let mut pg_stream = if ssl_response[0] == b'S' {
-        // Initialize rustls-rustcrypto as the default provider if not already installed.
         let _ = rustls_rustcrypto::provider().install_default();
 
         let mut root_store = rustls::RootCertStore::empty();
@@ -1973,10 +1972,6 @@ fn execute_raw_tcp_postgres(
     write_startup_message(&mut pg_stream, &pg_params.user, &pg_params.database)
         .map_err(|e| format!("Failed to send startup message: {}", e))?;
         
-    let mut columns = Vec::new();
-    let mut rows = Vec::new();
-    let mut query_sent = false;
-    
     loop {
         let msg = read_message(&mut pg_stream)
             .map_err(|e| format!("Failed to read message from Postgres: {}", e))?;
@@ -1988,7 +1983,7 @@ fn execute_raw_tcp_postgres(
                 }
                 let auth_type = u32::from_be_bytes([msg.payload[0], msg.payload[1], msg.payload[2], msg.payload[3]]);
                 match auth_type {
-                    0 => {}
+                    0 => {} // Auth OK
                     3 => {
                         let pwd = pg_params.password.as_deref().unwrap_or("");
                         write_password_message(&mut pg_stream, pwd)
@@ -2152,14 +2147,36 @@ fn execute_raw_tcp_postgres(
                 return Err(format!("Postgres error: {}", err_msg));
             }
             b'Z' => {
-                if !query_sent {
-                    let interpolated = interpolate_query(sql, &params)?;
-                    write_query_message(&mut pg_stream, &interpolated)
-                        .map_err(|e| format!("Failed to send query: {}", e))?;
-                    query_sent = true;
-                } else {
-                    break;
-                }
+                // Fully ready!
+                break;
+            }
+            _ => {}
+        }
+    }
+    
+    Ok(pg_stream)
+}
+
+fn execute_query_on_stream(
+    pg_stream: &mut PgStream,
+    sql: &str,
+    params: Vec<serde_json::Value>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let interpolated = interpolate_query(sql, &params)?;
+    write_query_message(pg_stream, &interpolated)
+        .map_err(|e| format!("Failed to send query: {}", e))?;
+        
+    let mut columns = Vec::new();
+    let mut rows = Vec::new();
+    
+    loop {
+        let msg = read_message(pg_stream)
+            .map_err(|e| format!("Failed to read message from Postgres: {}", e))?;
+            
+        match msg.msg_type {
+            b'E' => {
+                let err_msg = parse_error_response(&msg.payload);
+                return Err(format!("Postgres error: {}", err_msg));
             }
             b'T' => {
                 columns = parse_row_description(&msg.payload)
@@ -2170,11 +2187,77 @@ fn execute_raw_tcp_postgres(
                     .map_err(|e| format!("Failed to parse data row: {}", e))?;
                 rows.push(row);
             }
+            b'Z' => {
+                break;
+            }
             _ => {}
         }
     }
     
     Ok(rows)
+}
+
+fn execute_raw_tcp_postgres(
+    url: &str,
+    sql: &str,
+    params: Vec<serde_json::Value>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let pg_params = parse_pg_url(url)?;
+    let addr = format!("{}:{}", pg_params.host, pg_params.port);
+
+    let mut guard = PG_CONN.lock().map_err(|_| "Failed to lock PG_CONN mutex".to_string())?;
+
+    // Check if we have a cached connection for this exact URL
+    let pg_stream = if let Some((ref cached_url, _)) = *guard {
+        if cached_url == url {
+            // Take the connection from the guard so we can use it
+            let (_, stream) = guard.take().unwrap();
+            println!("[POSTGRES] Found cached connection for {}. Testing health...", pg_params.host);
+            Some(stream)
+        } else {
+            // URL mismatch, let's close/drop the old one
+            println!("[POSTGRES] Cached URL mismatch. Dropping cached connection.");
+            guard.take();
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(mut stream) = pg_stream {
+        // Try executing the query on the cached stream
+        match execute_query_on_stream(&mut stream, sql, params.clone()) {
+            Ok(rows) => {
+                // Connection is healthy! Put it back.
+                println!("[POSTGRES] Connection is HEALTHY. Reusing connection.");
+                *guard = Some((url.to_string(), stream));
+                return Ok(rows);
+            }
+            Err(e) => {
+                // Cached connection was stale/dead. Discard it (it is already taken out of guard).
+                // We will fall back to establishing a fresh connection below.
+                println!("[POSTGRES] Cached connection was STALE or FAILED: {}. Discarding and establishing a fresh connection...", e);
+            }
+        }
+    }
+
+    // Connect and authenticate a fresh stream
+    println!("[POSTGRES] Connecting to fresh Postgres instance at {}...", addr);
+    let mut fresh_stream = connect_and_auth_postgres(url, &pg_params, &addr)?;
+    println!("[POSTGRES] Fresh connection connected and authenticated successfully.");
+    
+    // Execute query on the fresh stream
+    let res = execute_query_on_stream(&mut fresh_stream, sql, params);
+
+    if res.is_ok() {
+        // Cache the fresh stream for future queries
+        println!("[POSTGRES] Query on fresh connection succeeded. Caching connection.");
+        *guard = Some((url.to_string(), fresh_stream));
+    } else {
+        println!("[POSTGRES] Query on fresh connection FAILED: {:?}", res.as_ref().err());
+    }
+
+    res
 }
 
 // -------------------------------------------------------------------------
