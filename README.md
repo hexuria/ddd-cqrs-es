@@ -19,6 +19,13 @@ To enable durable database adapters:
 * **SQLite Support:** Enable the `"sqlite"` feature.
 * **PostgreSQL Support:** Enable the `"postgres"` feature.
 
+The stable built-in SQL adapters are `SqliteEventStore`,
+`PostgresEventStore`, `SqliteCheckpointStore`, `PostgresCheckpointStore`,
+`SqliteIdempotencyStore`, and `PostgresIdempotencyStore`. WASI, Spin, Neon,
+LibSQL, and Supabase feature flags currently expose lower-level query helpers
+for examples and runtime experiments; they are not first-class reusable event
+store/checkpoint store backends yet.
+
 ---
 
 ## Detailed Conceptual Guides

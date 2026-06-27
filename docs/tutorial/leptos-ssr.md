@@ -696,7 +696,7 @@ impl Projection<CounterEvent, CounterId> for CounterProjection {
 ### Driving Projections with `PersistedProjectionRunner`
 To keep this read model updated sequentially, we use `PersistedProjectionRunner`. 
 
-When a command is executed, new events are appended. We load our last processed projection sequence from `SpinSqliteCheckpointStore`, fetch globally newer events from `SpinSqliteEventStore`, apply them sequentially to our projection, and update the checkpoint in a safe transaction:
+When a command is executed, new events are appended. We load our last processed projection sequence from `SpinSqliteCheckpointStore`, fetch globally newer events from `SpinSqliteEventStore`, apply them sequentially to our projection, and update the checkpoint after each successful event. The projection write and checkpoint write are not one transaction, so projection updates must be idempotent:
 
 ```rust
 use ddd_cqrs_es::PersistedProjectionRunner;
@@ -805,7 +805,8 @@ fn run_cqrs_command(command: crate::domain::CounterCommand) -> Result<(), Server
     repo.execute(&aggregate_id, command, ddd_cqrs_es::Metadata::default())
         .map_err(|e| ServerFnError::new(e.to_string()))?;
 
-    // Advance projection and update read-model checkpoint atomically
+    // Advance projection and save the checkpoint after successful projection writes.
+    // Projection writes must be idempotent because checkpoint updates are separate.
     let checkpoint_store = SpinSqliteCheckpointStore::new("default");
     let projection = CounterProjection::new("default");
     let mut runner = PersistedProjectionRunner::new(projection, checkpoint_store);
@@ -1006,31 +1007,33 @@ cp examples/counter-app/.env.example examples/counter-app/.env
 Open `examples/counter-app/.env` and inspect the configuration variables. This file is tracked by version control as a reference, enabling seamless collaboration and automated testing across local and cloud environments:
 
 ```ini
-# Supported backends: sqlite, postgres, neon, supabase, libsql, turso
+# Supported make backends: sqlite, postgres, neon, supabase, turso
 DATABASE_BACKEND=sqlite
 
+# make derives DATABASE_URL/DATABASE_AUTH_TOKEN from the backend-specific
+# values below before launching Spin or Wasmtime.
+
 # =========================================================================
-# 1. PostgreSQL Settings (Local PostgreSQL / Supabase)
+# 1. PostgreSQL Settings (Local PostgreSQL)
 # =========================================================================
 POSTGRES_URL=postgresql://postgres:postgres@localhost:5432/postgres
 
 # =========================================================================
-# 2. Neon Serverless Settings (HTTP SQL API)
+# 2. Neon Settings
 # =========================================================================
-NEON_URL=https://your-project.us-east-2.aws.neon.tech/sql
-NEON_API_KEY=your_neon_secret_token
+NEON_DB_URL=
 
 # =========================================================================
-# 3. Supabase REST API Settings
+# 3. Supabase Settings
 # =========================================================================
-SUPABASE_URL=https://your-project.supabase.co/rest/v1
-SUPABASE_ANON_KEY=your_supabase_anon_public_key
+SUPABASE_URL=
+SUPABASE_SECRET_KEY=
 
 # =========================================================================
-# 4. LibSQL / Turso Settings (Hrana HTTP API)
+# 4. LibSQL / Turso Settings (HTTP API)
 # =========================================================================
-TURSO_URL=https://your-db-name.turso.io
-TURSO_AUTH_TOKEN=your_turso_authorization_token
+TURSO_URL=
+TURSO_AUTH_TOKEN=
 ```
 
 ---
@@ -1157,9 +1160,8 @@ where
             "neon" => {
                 // Execute stateless queries over Outbound HTTP SQL API
                 let url = get_postgres_url();
-                let api_key = get_neon_api_key();
                 let sql = "SELECT ... FROM events WHERE aggregate_id = $1";
-                let rows = block_on(execute_neon_query(&url, api_key.as_deref(), sql, vec![aggregate_id.to_string()]))?;
+                let rows = block_on(execute_neon_query(&url, sql, vec![aggregate_id.to_string()]))?;
                 deserialize_postgres_rows(rows)
             }
             "turso" | "libsql" => {
@@ -1216,7 +1218,6 @@ make spin db=postgres
 ```
 
 Once launched, open your web browser to `http://127.0.0.1:3000` to interact with your secure, full-stack, optimistic-updating, Event-Sourced Leptos application!
-
 ---
 
 ## 💎 The Pure DDD & CQRS Advantage

@@ -257,8 +257,12 @@ impl<P, C> PersistedProjectionRunner<P, C>
 where
     C: CheckpointStore,
 {
-    /// Loads global events after the current persistent checkpoint and applies them,
-    /// updating the checkpoint store.
+    /// Loads global events after the current persistent checkpoint, applies them,
+    /// then saves each event sequence as the new checkpoint after successful
+    /// projection application.
+    ///
+    /// Projection side effects and checkpoint writes are not one transaction;
+    /// projection implementations must be idempotent for retry safety.
     #[allow(clippy::type_complexity)]
     pub fn run<A, S>(
         &mut self,
@@ -335,8 +339,12 @@ impl<P, C> AsyncPersistedProjectionRunner<P, C>
 where
     C: AsyncCheckpointStore,
 {
-    /// Loads global events after the current persistent checkpoint and applies them,
-    /// updating the checkpoint store.
+    /// Loads global events after the current persistent checkpoint, applies them,
+    /// then saves each event sequence as the new checkpoint after successful
+    /// projection application.
+    ///
+    /// Projection side effects and checkpoint writes are not one transaction;
+    /// projection implementations must be idempotent for retry safety.
     #[allow(clippy::type_complexity)]
     pub async fn run<A, S>(
         &mut self,

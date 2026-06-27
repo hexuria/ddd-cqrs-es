@@ -77,8 +77,10 @@ fn run_my_projection(
     );
 
     // 3. Trigger a projection poll run
-    // This loads events after the stored checkpoint, processes them, 
-    // and advances the checkpoint atomically per event sequence.
+    // This loads events after the stored checkpoint, applies them, and then
+    // advances the checkpoint for each successful event sequence.
+    // Projection writes and checkpoint writes are not one transaction, so the
+    // projection must be idempotent.
     let processed_count = runner.run(event_store)?;
     println!("Processed {} new events", processed_count);
 
@@ -86,27 +88,26 @@ fn run_my_projection(
 }
 ```
 
-### Example: Async Postgres Projection Runner
+### Example: Sync Postgres Projection Runner
 
 ```rust
 use ddd_cqrs_es::{
-    PostgresEventStore, PostgresCheckpointStore, AsyncPersistedProjectionRunner,
+    PostgresEventStore, PostgresCheckpointStore, PersistedProjectionRunner,
 };
 
-async fn run_my_async_projection(
+fn run_my_postgres_projection(
     event_store: &PostgresEventStore<BankAccount>,
     checkpoint_store: PostgresCheckpointStore,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut runner = AsyncPersistedProjectionRunner::new(
+    let mut runner = PersistedProjectionRunner::new(
         MyBankAccountProjection::new(),
         checkpoint_store,
     );
 
-    // Trigger an async projection poll run
-    let processed_count = runner.run(event_store).await?;
-    println!("Processed {} new events in async background thread", processed_count);
+    // Trigger a projection poll run.
+    let processed_count = runner.run(event_store)?;
+    println!("Processed {} new events", processed_count);
 
     Ok(())
 }
 ```
-

@@ -4,6 +4,7 @@ use crate::aggregate::Aggregate;
 use crate::error::EventStoreError;
 use crate::event::{EventEnvelope, EventId, ExpectedRevision, NewEvent};
 use crate::event_store::{EventStore, EventStream};
+use crate::idempotency::{IdempotencyKey, IdempotencyState, IdempotencyStore};
 use crate::sql_common::{
     check_expected_revision, deserialize_id, deserialize_metadata, deserialize_payload,
     millis_to_system_time, serialize_id, serialize_metadata, serialize_payload,
@@ -524,5 +525,213 @@ impl crate::projection::AsyncCheckpointStore for PostgresCheckpointStore {
         })
         .await
         .map_err(|e| EventStoreError::Backend(e.to_string()))?
+    }
+}
+
+/// PostgreSQL-backed idempotency store.
+///
+/// The store persists pending reservations and completed JSON-serializable
+/// values so command retries can be deduplicated across process restarts.
+pub struct PostgresIdempotencyStore<V>
+where
+    V: Clone,
+{
+    client: Arc<Mutex<Client>>,
+    table_name: String,
+    _marker: PhantomData<fn() -> V>,
+}
+
+impl<V> Clone for PostgresIdempotencyStore<V>
+where
+    V: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            client: Arc::clone(&self.client),
+            table_name: self.table_name.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<V> std::fmt::Debug for PostgresIdempotencyStore<V>
+where
+    V: Clone,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresIdempotencyStore")
+            .field("table_name", &self.table_name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<V> PostgresIdempotencyStore<V>
+where
+    V: Clone,
+{
+    /// Creates a PostgreSQL idempotency store using the default table name.
+    pub fn new(client: Client) -> Result<Self, EventStoreError> {
+        Self::with_table_name(client, "idempotency_keys")
+    }
+
+    /// Creates a PostgreSQL idempotency store with a custom table name.
+    pub fn with_table_name(
+        client: Client,
+        table_name: impl Into<String>,
+    ) -> Result<Self, EventStoreError> {
+        let table_name = table_name.into();
+        validate_table_name(&table_name)?;
+
+        let store = Self {
+            client: Arc::new(Mutex::new(client)),
+            table_name,
+            _marker: PhantomData,
+        };
+        store.initialize_schema()?;
+        Ok(store)
+    }
+
+    /// Initializes the idempotency schema table.
+    pub fn initialize_schema(&self) -> Result<(), EventStoreError> {
+        let mut client = self.client.lock().map_err(|_| EventStoreError::Poisoned)?;
+        let sql = format!(
+            "CREATE TABLE IF NOT EXISTS {} (
+                idempotency_key TEXT PRIMARY KEY,
+                state TEXT NOT NULL CHECK (state IN ('pending', 'complete')),
+                value JSONB,
+                updated_at_ms BIGINT NOT NULL
+            );",
+            self.table_name
+        );
+        client.execute(&sql, &[]).map_err(map_postgres_error)?;
+        Ok(())
+    }
+}
+
+impl<V> IdempotencyStore<V> for PostgresIdempotencyStore<V>
+where
+    V: Clone + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+{
+    type Error = EventStoreError;
+
+    fn load(&self, key: &IdempotencyKey) -> Result<Option<IdempotencyState<V>>, Self::Error> {
+        let mut client = self.client.lock().map_err(|_| EventStoreError::Poisoned)?;
+        let sql = format!(
+            "SELECT state, value FROM {} WHERE idempotency_key = $1;",
+            self.table_name
+        );
+        let row = client
+            .query_opt(&sql, &[&key.as_str()])
+            .map_err(map_postgres_error)?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let state: String = row.try_get(0).map_err(map_postgres_error)?;
+        let value: Option<serde_json::Value> = row.try_get(1).map_err(map_postgres_error)?;
+
+        match (state.as_str(), value) {
+            ("pending", _) => Ok(Some(IdempotencyState::Pending)),
+            ("complete", Some(value)) => {
+                let value = serde_json::from_value(value).map_err(|error| {
+                    EventStoreError::Deserialization(format!("idempotency value JSON: {error}"))
+                })?;
+                Ok(Some(IdempotencyState::Complete(value)))
+            }
+            ("complete", None) => Err(EventStoreError::Deserialization(
+                "completed idempotency row is missing value".to_owned(),
+            )),
+            (state, _) => Err(EventStoreError::Deserialization(format!(
+                "unknown idempotency state: {state}"
+            ))),
+        }
+    }
+
+    fn reserve(&self, key: IdempotencyKey) -> Result<bool, Self::Error> {
+        let mut client = self.client.lock().map_err(|_| EventStoreError::Poisoned)?;
+        let updated_at_ms = system_time_to_millis(SystemTime::now())?;
+        let sql = format!(
+            "INSERT INTO {} (idempotency_key, state, value, updated_at_ms)
+             VALUES ($1, 'pending', NULL, $2)
+             ON CONFLICT (idempotency_key) DO NOTHING;",
+            self.table_name
+        );
+        let changed = client
+            .execute(&sql, &[&key.as_str(), &updated_at_ms])
+            .map_err(map_postgres_error)?;
+        Ok(changed == 1)
+    }
+
+    fn save(&self, key: IdempotencyKey, value: V) -> Result<(), Self::Error> {
+        let mut client = self.client.lock().map_err(|_| EventStoreError::Poisoned)?;
+        let updated_at_ms = system_time_to_millis(SystemTime::now())?;
+        let value_json = serde_json::to_value(value).map_err(|error| {
+            EventStoreError::Serialization(format!("idempotency value JSON: {error}"))
+        })?;
+        let sql = format!(
+            "INSERT INTO {} (idempotency_key, state, value, updated_at_ms)
+             VALUES ($1, 'complete', $2::jsonb, $3)
+             ON CONFLICT (idempotency_key) DO UPDATE SET
+                state = EXCLUDED.state,
+                value = EXCLUDED.value,
+                updated_at_ms = EXCLUDED.updated_at_ms;",
+            self.table_name
+        );
+        client
+            .execute(&sql, &[&key.as_str(), &value_json, &updated_at_ms])
+            .map_err(map_postgres_error)?;
+        Ok(())
+    }
+
+    fn remove(&self, key: &IdempotencyKey) -> Result<(), Self::Error> {
+        let mut client = self.client.lock().map_err(|_| EventStoreError::Poisoned)?;
+        let sql = format!(
+            "DELETE FROM {} WHERE idempotency_key = $1;",
+            self.table_name
+        );
+        client
+            .execute(&sql, &[&key.as_str()])
+            .map_err(map_postgres_error)?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "async")]
+#[async_trait::async_trait]
+impl<V> crate::async_api::AsyncIdempotencyStore<V> for PostgresIdempotencyStore<V>
+where
+    V: Clone + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+{
+    type Error = EventStoreError;
+
+    async fn load(&self, key: &IdempotencyKey) -> Result<Option<IdempotencyState<V>>, Self::Error> {
+        let this = self.clone();
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || IdempotencyStore::load(&this, &key))
+            .await
+            .map_err(|e| EventStoreError::Backend(e.to_string()))?
+    }
+
+    async fn reserve(&self, key: IdempotencyKey) -> Result<bool, Self::Error> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || IdempotencyStore::reserve(&this, key))
+            .await
+            .map_err(|e| EventStoreError::Backend(e.to_string()))?
+    }
+
+    async fn save(&self, key: IdempotencyKey, value: V) -> Result<(), Self::Error> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || IdempotencyStore::save(&this, key, value))
+            .await
+            .map_err(|e| EventStoreError::Backend(e.to_string()))?
+    }
+
+    async fn remove(&self, key: &IdempotencyKey) -> Result<(), Self::Error> {
+        let this = self.clone();
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || IdempotencyStore::remove(&this, &key))
+            .await
+            .map_err(|e| EventStoreError::Backend(e.to_string()))?
     }
 }

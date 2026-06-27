@@ -1,8 +1,9 @@
 use ddd_cqrs_es::{
     assert_event_store_contract, Aggregate, AggregateFixture, ConcurrencyError, DomainEvent,
-    EventStore, EventStoreError, ExpectedRevision, IdempotencyKey, InMemoryEventStore,
-    InMemoryIdempotencyStore, InMemoryProjectionRunner, InMemorySnapshotStore, Metadata, NewEvent,
-    Projection, Repository, RepositoryError, Snapshot, SnapshotStore,
+    EventStore, EventStoreError, ExpectedRevision, IdempotencyKey, IdempotencyState,
+    IdempotencyStore, InMemoryEventStore, InMemoryIdempotencyStore, InMemoryProjectionRunner,
+    InMemorySnapshotStore, Metadata, NewEvent, Projection, Repository, RepositoryError, Snapshot,
+    SnapshotStore,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,6 +30,69 @@ impl DomainEvent for CounterEvent {
 enum CounterCommand {
     Create,
     Increment { by: u64 },
+}
+
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct StoredIdempotencyResult {
+    value: u64,
+    label: String,
+}
+
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+fn assert_sql_idempotency_store_contract<S>(store: S)
+where
+    S: IdempotencyStore<StoredIdempotencyResult, Error = EventStoreError>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
+    let missing_key = IdempotencyKey::new("sql-idempotency-missing");
+    assert_eq!(store.load(&missing_key).unwrap(), None);
+
+    let key = IdempotencyKey::new("sql-idempotency-complete");
+    assert!(store.reserve(key.clone()).unwrap());
+    assert_eq!(store.load(&key).unwrap(), Some(IdempotencyState::Pending));
+    assert!(!store.reserve(key.clone()).unwrap());
+
+    let value = StoredIdempotencyResult {
+        value: 42,
+        label: "json-round-trip".to_owned(),
+    };
+    store.save(key.clone(), value.clone()).unwrap();
+    assert_eq!(
+        store.load(&key).unwrap(),
+        Some(IdempotencyState::Complete(value.clone()))
+    );
+    assert!(!store.reserve(key.clone()).unwrap());
+
+    let failed_key = IdempotencyKey::new("sql-idempotency-failed");
+    assert!(store.reserve(failed_key.clone()).unwrap());
+    store.remove(&failed_key).unwrap();
+    assert_eq!(store.load(&failed_key).unwrap(), None);
+    assert!(store.reserve(failed_key.clone()).unwrap());
+
+    let concurrent_key = IdempotencyKey::new("sql-idempotency-concurrent");
+    let store = Arc::new(store);
+    let handles = (0..10)
+        .map(|_| {
+            let store = Arc::clone(&store);
+            let key = concurrent_key.clone();
+            thread::spawn(move || store.reserve(key).unwrap())
+        })
+        .collect::<Vec<_>>();
+    let winners = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .filter(|reserved| *reserved)
+        .count();
+
+    assert_eq!(winners, 1);
+    assert_eq!(
+        store.load(&concurrent_key).unwrap(),
+        Some(IdempotencyState::Pending)
+    );
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -179,6 +243,14 @@ fn sqlite_store_passes_reusable_contract() {
     );
 }
 
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_idempotency_store_passes_contract() {
+    let connection = rusqlite::Connection::open_in_memory().unwrap();
+    let store = ddd_cqrs_es::SqliteIdempotencyStore::new(connection).unwrap();
+    assert_sql_idempotency_store_contract(store);
+}
+
 #[cfg(feature = "postgres")]
 #[test]
 fn postgres_store_passes_reusable_contract_when_url_is_provided() {
@@ -207,6 +279,64 @@ fn postgres_store_passes_reusable_contract_when_url_is_provided() {
         "postgres-contract-counter".to_owned(),
         CounterEvent::Created,
         CounterEvent::Incremented { by: 1 },
+    );
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_idempotency_store_passes_contract_when_url_is_provided() {
+    let Ok(database_url) = std::env::var("DDD_CQRS_ES_POSTGRES_URL") else {
+        eprintln!("skipping live Postgres idempotency test: DDD_CQRS_ES_POSTGRES_URL is not set");
+        return;
+    };
+    let table_name = format!(
+        "idempotency_live_contract_{}_{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+
+    let client = postgres::Client::connect(&database_url, postgres::NoTls).unwrap();
+    let store =
+        ddd_cqrs_es::PostgresIdempotencyStore::with_table_name(client, table_name.clone()).unwrap();
+
+    assert_sql_idempotency_store_contract(store.clone());
+    drop(store);
+
+    let mut cleanup = postgres::Client::connect(&database_url, postgres::NoTls).unwrap();
+    cleanup
+        .batch_execute(&format!("DROP TABLE IF EXISTS {table_name};"))
+        .unwrap();
+}
+
+#[cfg(feature = "json")]
+#[test]
+fn postgres_interpolation_escapes_strings_and_rejects_bad_parameter_indexes() {
+    let sql = ddd_cqrs_es::adapters::interpolate_query(
+        "SELECT $1, $2, $3",
+        &[
+            serde_json::json!("O'Reilly"),
+            serde_json::json!({ "text": "it's quoted" }),
+            serde_json::Value::Null,
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(
+        sql,
+        "SELECT 'O''Reilly', '{\"text\":\"it''s quoted\"}', NULL"
+    );
+    assert!(
+        ddd_cqrs_es::adapters::interpolate_query("SELECT $0", &[serde_json::json!(1)])
+            .unwrap_err()
+            .contains("out of bounds")
+    );
+    assert!(
+        ddd_cqrs_es::adapters::interpolate_query("SELECT $2", &[serde_json::json!(1)])
+            .unwrap_err()
+            .contains("out of bounds")
     );
 }
 

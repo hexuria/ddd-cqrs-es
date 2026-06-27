@@ -87,6 +87,8 @@
 //! # Ok::<(), ddd_cqrs_es::RepositoryError<CounterError>>(())
 //! ```
 
+#[cfg(feature = "json")]
+pub mod adapters;
 pub mod aggregate;
 #[cfg(feature = "async")]
 pub mod async_api;
@@ -132,7 +134,7 @@ pub use idempotency::{
 pub use memory::InMemoryEventStore;
 pub use metadata::Metadata;
 #[cfg(feature = "postgres")]
-pub use postgres::{PostgresCheckpointStore, PostgresEventStore};
+pub use postgres::{PostgresCheckpointStore, PostgresEventStore, PostgresIdempotencyStore};
 pub use process_manager::ProcessManager;
 #[cfg(feature = "async")]
 pub use projection::{AsyncCheckpointStore, AsyncPersistedProjectionRunner};
@@ -148,6 +150,6 @@ pub use snapshot::{
     InMemorySnapshotError, InMemorySnapshotStore, Snapshot, SnapshotRepositoryError, SnapshotStore,
 };
 #[cfg(feature = "sqlite")]
-pub use sqlite::{SqliteCheckpointStore, SqliteEventStore};
+pub use sqlite::{SqliteCheckpointStore, SqliteEventStore, SqliteIdempotencyStore};
 pub use testing::{assert_event_store_contract, AggregateFixture};
 pub use upcast::{ErasedUpcaster, EventUpcaster, UpcasterRegistry};

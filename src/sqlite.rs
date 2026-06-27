@@ -4,13 +4,14 @@ use crate::aggregate::Aggregate;
 use crate::error::EventStoreError;
 use crate::event::{EventEnvelope, EventId, ExpectedRevision, NewEvent};
 use crate::event_store::{EventStore, EventStream};
+use crate::idempotency::{IdempotencyKey, IdempotencyState, IdempotencyStore};
 use crate::sql_common::{
     check_expected_revision, deserialize_id, deserialize_metadata, deserialize_payload,
     millis_to_system_time, serialize_id, serialize_metadata, serialize_payload,
     system_time_to_millis, validate_table_name,
 };
 use crate::upcast::UpcasterRegistry;
-use rusqlite::{params, Connection, ErrorCode};
+use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -561,5 +562,226 @@ impl crate::projection::AsyncCheckpointStore for SqliteCheckpointStore {
         })
         .await
         .map_err(|e| EventStoreError::Backend(e.to_string()))?
+    }
+}
+
+/// SQLite-backed idempotency store.
+///
+/// The store persists pending reservations and completed JSON-serializable
+/// values so command retries can be deduplicated across process restarts.
+pub struct SqliteIdempotencyStore<V>
+where
+    V: Clone,
+{
+    connection: Arc<Mutex<Connection>>,
+    table_name: String,
+    _marker: PhantomData<fn() -> V>,
+}
+
+impl<V> Clone for SqliteIdempotencyStore<V>
+where
+    V: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            connection: Arc::clone(&self.connection),
+            table_name: self.table_name.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<V> std::fmt::Debug for SqliteIdempotencyStore<V>
+where
+    V: Clone,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SqliteIdempotencyStore")
+            .field("table_name", &self.table_name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<V> SqliteIdempotencyStore<V>
+where
+    V: Clone,
+{
+    /// Creates a SQLite idempotency store using the default table name.
+    pub fn new(connection: Connection) -> Result<Self, EventStoreError> {
+        Self::with_table_name(connection, "idempotency_keys")
+    }
+
+    /// Creates a SQLite idempotency store with a custom table name.
+    pub fn with_table_name(
+        connection: Connection,
+        table_name: impl Into<String>,
+    ) -> Result<Self, EventStoreError> {
+        let table_name = table_name.into();
+        validate_table_name(&table_name)?;
+
+        let store = Self {
+            connection: Arc::new(Mutex::new(connection)),
+            table_name,
+            _marker: PhantomData,
+        };
+        store.initialize_schema()?;
+        Ok(store)
+    }
+
+    /// Initializes the idempotency schema table.
+    pub fn initialize_schema(&self) -> Result<(), EventStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| EventStoreError::Poisoned)?;
+        let sql = format!(
+            "CREATE TABLE IF NOT EXISTS {} (
+                idempotency_key TEXT PRIMARY KEY,
+                state TEXT NOT NULL CHECK (state IN ('pending', 'complete')),
+                value TEXT,
+                updated_at_ms INTEGER NOT NULL
+            );",
+            self.table_name
+        );
+        connection.execute(&sql, []).map_err(map_sqlite_error)?;
+        Ok(())
+    }
+}
+
+impl<V> IdempotencyStore<V> for SqliteIdempotencyStore<V>
+where
+    V: Clone + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+{
+    type Error = EventStoreError;
+
+    fn load(&self, key: &IdempotencyKey) -> Result<Option<IdempotencyState<V>>, Self::Error> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| EventStoreError::Poisoned)?;
+        let sql = format!(
+            "SELECT state, value FROM {} WHERE idempotency_key = ?1;",
+            self.table_name
+        );
+        let row = connection
+            .query_row(&sql, params![key.as_str()], |row| {
+                let state: String = row.get(0)?;
+                let value: Option<String> = row.get(1)?;
+                Ok((state, value))
+            })
+            .optional()
+            .map_err(map_sqlite_error)?;
+
+        match row {
+            None => Ok(None),
+            Some((state, _)) if state == "pending" => Ok(Some(IdempotencyState::Pending)),
+            Some((state, Some(value))) if state == "complete" => {
+                let value = serde_json::from_str(&value).map_err(|error| {
+                    EventStoreError::Deserialization(format!("idempotency value JSON: {error}"))
+                })?;
+                Ok(Some(IdempotencyState::Complete(value)))
+            }
+            Some((state, None)) if state == "complete" => Err(EventStoreError::Deserialization(
+                "completed idempotency row is missing value".to_owned(),
+            )),
+            Some((state, _)) => Err(EventStoreError::Deserialization(format!(
+                "unknown idempotency state: {state}"
+            ))),
+        }
+    }
+
+    fn reserve(&self, key: IdempotencyKey) -> Result<bool, Self::Error> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| EventStoreError::Poisoned)?;
+        let updated_at_ms = system_time_to_millis(SystemTime::now())?;
+        let sql = format!(
+            "INSERT OR IGNORE INTO {} (idempotency_key, state, value, updated_at_ms)
+             VALUES (?1, 'pending', NULL, ?2);",
+            self.table_name
+        );
+        let changed = connection
+            .execute(&sql, params![key.as_str(), updated_at_ms])
+            .map_err(map_sqlite_error)?;
+        Ok(changed == 1)
+    }
+
+    fn save(&self, key: IdempotencyKey, value: V) -> Result<(), Self::Error> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| EventStoreError::Poisoned)?;
+        let updated_at_ms = system_time_to_millis(SystemTime::now())?;
+        let value_json = serde_json::to_string(&value).map_err(|error| {
+            EventStoreError::Serialization(format!("idempotency value JSON: {error}"))
+        })?;
+        let sql = format!(
+            "INSERT INTO {} (idempotency_key, state, value, updated_at_ms)
+             VALUES (?1, 'complete', ?2, ?3)
+             ON CONFLICT(idempotency_key) DO UPDATE SET
+                state = excluded.state,
+                value = excluded.value,
+                updated_at_ms = excluded.updated_at_ms;",
+            self.table_name
+        );
+        connection
+            .execute(&sql, params![key.as_str(), value_json, updated_at_ms])
+            .map_err(map_sqlite_error)?;
+        Ok(())
+    }
+
+    fn remove(&self, key: &IdempotencyKey) -> Result<(), Self::Error> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| EventStoreError::Poisoned)?;
+        let sql = format!(
+            "DELETE FROM {} WHERE idempotency_key = ?1;",
+            self.table_name
+        );
+        connection
+            .execute(&sql, params![key.as_str()])
+            .map_err(map_sqlite_error)?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "async")]
+#[async_trait::async_trait]
+impl<V> crate::async_api::AsyncIdempotencyStore<V> for SqliteIdempotencyStore<V>
+where
+    V: Clone + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+{
+    type Error = EventStoreError;
+
+    async fn load(&self, key: &IdempotencyKey) -> Result<Option<IdempotencyState<V>>, Self::Error> {
+        let this = self.clone();
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || IdempotencyStore::load(&this, &key))
+            .await
+            .map_err(|e| EventStoreError::Backend(e.to_string()))?
+    }
+
+    async fn reserve(&self, key: IdempotencyKey) -> Result<bool, Self::Error> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || IdempotencyStore::reserve(&this, key))
+            .await
+            .map_err(|e| EventStoreError::Backend(e.to_string()))?
+    }
+
+    async fn save(&self, key: IdempotencyKey, value: V) -> Result<(), Self::Error> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || IdempotencyStore::save(&this, key, value))
+            .await
+            .map_err(|e| EventStoreError::Backend(e.to_string()))?
+    }
+
+    async fn remove(&self, key: &IdempotencyKey) -> Result<(), Self::Error> {
+        let this = self.clone();
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || IdempotencyStore::remove(&this, &key))
+            .await
+            .map_err(|e| EventStoreError::Backend(e.to_string()))?
     }
 }
