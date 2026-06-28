@@ -20,14 +20,23 @@ ddd_cqrs_es = { path = "../ddd" }
 
 ### Feature Flags
 
-Our framework is highly modular. You can enable specific adapters and engines depending on your production requirements:
+Our framework is highly modular. You can enable specific adapters and engines depending on your production requirements.
 
-The stable built-in durable adapters are SQLite and PostgreSQL. Runtime-specific
-WASI, Spin, Neon, LibSQL, and Supabase flags expose lower-level query helpers
-for examples and experiments until they implement the library's reusable event
-store, checkpoint store, and idempotency store contracts. Redis exposes an
-experimental async event store, checkpoint store, and pub/sub notification
-surface.
+#### Enabling Durable Database Adapters:
+* **SQLite Support:** Enable the `"sqlite"` feature (uses the `rusqlite` driver under the hood).
+* **PostgreSQL Support:** Enable the `"postgres"` feature (uses the `postgres` driver under the hood).
+
+#### Supported Backends:
+* **SQLite / Local File:** Standard local embedded SQL.
+* **PostgreSQL:** Stable high-performance relational database.
+* **LibSQL / Turso:** Supported for distributed edge SQL via the `"wasi-libsql"` query helper.
+* **Redis:** Supported for async event store, checkpoints, and pub/sub notifications via `"redis"` / `"wasi-redis"` / `"spin-redis"`.
+* ⚠️ **MySQL:** **Not supported.** We do not provide MySQL adapters or query helpers.
+
+#### Realtime Updates Support:
+Real-time streaming and state updates are supported out-of-the-box when using:
+1. **PostgreSQL / SQLite:** Supported via native asynchronous HTTP Response Streaming / Server-Sent Events (SSE) polling streams using WASIp3 non-blocking timers.
+2. **Redis:** Supported natively via Redis Pub/Sub wake-up notifications and SSE connections.
 
 | Feature | Description | Third-Party Dependencies |
 | :--- | :--- | :--- |

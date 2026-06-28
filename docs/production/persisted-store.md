@@ -85,7 +85,27 @@ CREATE TABLE events (
 
 ## Configuring Database Adapters
 
-Our framework provides built-in adapters for both SQLite and PostgreSQL.
+Our framework supports multiple database options depending on your environment.
+
+### Database Support Matrix
+
+| Database Backend | Feature Flag | Supported Modes | Realtime Support | Production Ready |
+| :--- | :--- | :--- | :--- | :--- |
+| **SQLite** | `"sqlite"` | Native Sync (event, checkpoint, idempotency) | Yes (via SSE polling/polling stream) | Yes |
+| **PostgreSQL** | `"postgres"` | Native Sync (event, checkpoint, idempotency) | Yes (via SSE polling/polling stream) | Yes |
+| **LibSQL / Turso** | `"wasi-libsql"` | Async HTTP / Hrana SQL query helpers | No | Experimental / WASM |
+| **Redis** | `"redis"` | Async (event, checkpoint, pub/sub) | Yes (via Pub/Sub / SSE notifications) | Experimental / WASM |
+| **MySQL** | *None* | **Not Supported** | No | No |
+
+#### To Enable Durable Database Adapters:
+* **SQLite Support:** Enable the `"sqlite"` feature.
+* **PostgreSQL Support:** Enable the `"postgres"` feature.
+* **LibSQL Support:** Enable the `"wasi-libsql"` feature.
+* **Redis Support:** Enable the `"redis"` feature with `"wasi-redis"` or `"spin-redis"`.
+
+> [!NOTE]
+> **MySQL is not supported** by our framework. We support SQLite, PostgreSQL, LibSQL, and Redis backends.
+> Real-time updates are supported out-of-the-box with **PostgreSQL** and **Redis** (as well as SQLite). Postgres/SQLite utilize native asynchronous HTTP response streaming (SSE) polling streams with non-blocking clocks, while Redis utilizes Pub/Sub and SSE notifications.
 
 ### 1. SQLite Store (Embedded File)
 Perfect for edge applications, local databases, or desktop apps. Enable with the `"sqlite"` feature.
