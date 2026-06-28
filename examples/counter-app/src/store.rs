@@ -1432,12 +1432,26 @@ fn event_logs_from_value(value: Option<&serde_json::Value>) -> Result<Vec<crate:
         return Ok(Vec::new());
     };
 
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+
     let parsed;
     let value = if let Some(s) = value.as_str() {
-        parsed = serde_json::from_str::<serde_json::Value>(s)
-            .map_err(|e| format!("Failed to parse latest_events JSON: {}", e))?;
+        let s_trimmed = s.trim();
+        tracing::debug!("[event_logs_from_value] input string s_trimmed: {:?}", s_trimmed);
+        if s_trimmed.is_empty() {
+            return Ok(Vec::new());
+        }
+        parsed = serde_json::from_str::<serde_json::Value>(s_trimmed)
+            .map_err(|e| {
+                tracing::error!("[event_logs_from_value] parsing failed! error: {}, string: {:?}", e, s_trimmed);
+                format!("Failed to parse latest_events JSON: {}", e)
+            })?;
+        tracing::debug!("[event_logs_from_value] successfully parsed value: {:?}", parsed);
         &parsed
     } else {
+        tracing::debug!("[event_logs_from_value] input is not a string, value: {:?}", value);
         value
     };
 
@@ -1515,6 +1529,7 @@ pub async fn get_counter_view_db() -> Result<crate::app::CounterViewDto, String>
             realtime_enabled: get_realtime_backend() != "off",
         });
     };
+    tracing::debug!("[get_counter_view_db] row: {}", serde_json::to_string(row).unwrap_or_default());
     let latest_events = event_logs_from_value(row.get("latest_events"))?;
     let last_sequence = latest_events.first().map(|event| event.sequence).unwrap_or(0);
 
@@ -2003,17 +2018,6 @@ impl CounterStreamState {
         }
     }
 
-    async fn next_poll_frame(&mut self) -> String {
-        match counter_realtime_message_after(self.last_sequence).await {
-            Ok(Some(message)) => {
-                self.last_sequence = message.last_sequence;
-                counter_sse_frame(&message)
-            }
-            Ok(None) => counter_sse_ping_frame(),
-            Err(error) => counter_sse_error_frame(&error),
-        }
-    }
-
     async fn next_message(&mut self) -> Result<Option<crate::app::CounterRealtimeMessage>, String> {
         if !self.checked_initial_catchup {
             self.checked_initial_catchup = true;
@@ -2120,16 +2124,6 @@ fn counter_sse_error_frame(error: &str) -> String {
 }
 
 #[cfg(feature = "ssr")]
-fn counter_sse_ping_frame() -> String {
-    let retry_ms = if get_realtime_backend() == "redis" {
-        250
-    } else {
-        1_000
-    };
-    format!("retry: {retry_ms}\nevent: ping\ndata: {{}}\n\n")
-}
-
-#[cfg(feature = "ssr")]
 fn counter_sse_keepalive_frame() -> String {
     "retry: 1000\n: keepalive\n\n".to_string()
 }
@@ -2179,10 +2173,41 @@ pub async fn counter_stream_response(
             >,
         >
     } else {
-        let mut state = state;
-        let frame = state.next_poll_frame().await;
-        let s = futures::stream::once(async move {
-            Ok::<_, std::io::Error>(http_body::Frame::data(bytes::Bytes::from(frame)))
+        let s = futures::stream::unfold(state, |mut state| async move {
+            let mut pings = 0;
+            loop {
+                match counter_realtime_message_after(state.last_sequence).await {
+                    Ok(Some(message)) => {
+                        state.last_sequence = message.last_sequence;
+                        let frame = counter_sse_frame(&message);
+                        return Some((
+                            Ok::<_, std::io::Error>(http_body::Frame::data(bytes::Bytes::from(frame))),
+                            state,
+                        ));
+                    }
+                    Ok(None) => {
+                        // Sleep for 100 milliseconds
+                        wasip3::clocks::monotonic_clock::wait_for(100_000_000).await;
+                        pings += 1;
+                        // Send a keepalive comment every 15 seconds to prevent gateway timeout
+                        if pings >= 150 {
+                            let frame = counter_sse_keepalive_frame();
+                            return Some((
+                                Ok::<_, std::io::Error>(http_body::Frame::data(bytes::Bytes::from(frame))),
+                                state,
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        wasip3::clocks::monotonic_clock::wait_for(1_000_000_000).await;
+                        let frame = counter_sse_error_frame(&error);
+                        return Some((
+                            Ok::<_, std::io::Error>(http_body::Frame::data(bytes::Bytes::from(frame))),
+                            state,
+                        ));
+                    }
+                }
+            }
         });
         Box::pin(s) as std::pin::Pin<
             Box<

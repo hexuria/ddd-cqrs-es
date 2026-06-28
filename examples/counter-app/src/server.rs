@@ -12,6 +12,10 @@ impl wasip3::exports::http::handler::Guest for LeptosServer {
         // 1. Initialize host async task scheduling
         let _ = init_wasip3_spawner();
 
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+
         // Convert the WASI request to http::Request before storage work so
         // static assets do not trigger remote schema checks.
         let req = wasip3::http_compat::http_from_wasi_request(request)?;

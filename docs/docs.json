@@ -76,7 +76,8 @@
           "production/redis",
           "production/metadata",
           "production/upcasters",
-          "production/axum-integration"
+          "production/axum-integration",
+          "production/troubleshooting"
         ]
       },
       {

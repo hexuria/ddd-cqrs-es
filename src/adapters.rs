@@ -1659,6 +1659,20 @@ pub async fn execute_spin_pg(
                     SpinPgDbVal::Binary(b) => {
                         serde_json::Value::String(String::from_utf8_lossy(b).into_owned())
                     }
+                    SpinPgDbVal::Jsonb(j) => {
+                        if let Ok(jv) = serde_json::from_slice::<serde_json::Value>(j) {
+                            jv
+                        } else {
+                            serde_json::Value::String(String::from_utf8_lossy(j).into_owned())
+                        }
+                    }
+                    SpinPgDbVal::Unsupported(b) => {
+                        if let Ok(jv) = serde_json::from_slice::<serde_json::Value>(b) {
+                            jv
+                        } else {
+                            serde_json::Value::String(String::from_utf8_lossy(b).into_owned())
+                        }
+                    }
                     other => serde_json::Value::String(format!("{:?}", other)),
                 };
                 row_obj.insert(col_name, json_val);
