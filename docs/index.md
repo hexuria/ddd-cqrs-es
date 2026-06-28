@@ -15,7 +15,11 @@ Add the crate as a dependency in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ddd_cqrs_es = { path = "../ddd" }
+# From GitHub repository:
+ddd_cqrs_es = { git = "https://github.com/hexuria/ddd-cqrs-es" }
+
+# Or from crates.io (once published):
+# ddd_cqrs_es = "0.1.0"
 ```
 
 ### Feature Flags
