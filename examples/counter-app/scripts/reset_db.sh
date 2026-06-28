@@ -133,6 +133,23 @@ EOF
     echo "LibSQL schema successfully dropped and re-created."
     ;;
 
+  redis)
+    REDIS_RESET_URL="${DATABASE_URL:-${REDIS_URL:-redis://127.0.0.1:6379}}"
+    if ! command -v redis-cli >/dev/null 2>&1; then
+      echo "Error: redis-cli is required to reset Redis keys." >&2
+      exit 1
+    fi
+
+    echo "Resetting Redis keys at $REDIS_RESET_URL..."
+    for pattern in "ddd_cqrs_es:*" "counter:read_model:*" "counter:redis_trigger:*" "counter:realtime:*"; do
+      KEYS="$(redis-cli -u "$REDIS_RESET_URL" --scan --pattern "$pattern")"
+      if [ -n "$KEYS" ]; then
+        printf '%s\n' "$KEYS" | xargs redis-cli -u "$REDIS_RESET_URL" del >/dev/null
+      fi
+    done
+    echo "Redis event-store, checkpoint, read-model, and realtime keys reset."
+    ;;
+
   *)
     echo "Unsupported DATABASE_BACKEND: $BACKEND" >&2
     exit 1

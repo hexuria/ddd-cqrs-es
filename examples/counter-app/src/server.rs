@@ -26,6 +26,16 @@ impl wasip3::exports::http::handler::Guest for LeptosServer {
             }
         }
 
+        if request_path == "/api/counter/stream" {
+            let response = crate::store::counter_stream_response(&req)
+                .await
+                .map_err(|e| {
+                    eprintln!("Error building counter stream response: {:?}", e);
+                    ErrorCode::InternalError(None)
+                })?;
+            return wasip3::http_compat::http_into_wasi_response(response);
+        }
+
         let conf = get_configuration(None).unwrap();
         let leptos_options = conf.leptos_options;
 

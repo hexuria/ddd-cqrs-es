@@ -103,9 +103,11 @@ pub mod metadata;
 pub mod postgres;
 pub mod process_manager;
 pub mod projection;
+#[cfg(feature = "redis")]
+pub mod redis;
 pub mod repository;
 pub mod snapshot;
-#[cfg(any(feature = "postgres", feature = "sqlite"))]
+#[cfg(any(feature = "postgres", feature = "sqlite", feature = "redis"))]
 mod sql_common;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
@@ -141,6 +143,14 @@ pub use projection::{AsyncCheckpointStore, AsyncPersistedProjectionRunner};
 pub use projection::{
     CheckpointStore, InMemoryProjectionRunner, PersistedProjectionRunner, Projection,
     ProjectionRunnerError,
+};
+#[cfg(feature = "spin-redis")]
+pub use redis::SpinRedisClient;
+#[cfg(feature = "wasi-redis")]
+pub use redis::WasiRedisClient;
+#[cfg(feature = "redis")]
+pub use redis::{
+    RedisCheckpointStore, RedisCommandExecutor, RedisEventStore, RedisPubSubPublisher,
 };
 pub use repository::{
     CommittedEvents, ExecutionOutcome, IdempotentRepositoryResult, Repository, RepositoryResult,

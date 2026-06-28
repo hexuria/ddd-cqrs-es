@@ -126,3 +126,26 @@ fn setup_postgres() -> Result<Repository<BankAccount, PostgresEventStore<BankAcc
     Ok(repo)
 }
 ```
+
+### 3. Redis Store (Experimental Async)
+Redis support is async-only and experimental. Enable `"redis"` with either
+`"wasi-redis"` for the raw RESP WASI client or `"spin-redis"` for Spin SDK
+Redis. The adapter uses a Lua append script for atomic expected-revision
+checks, global sequence allocation, stream revision updates, and event indexes.
+
+```rust,no_run
+use ddd_cqrs_es::{AsyncRepository, RedisEventStore, WasiRedisClient};
+
+# async fn setup_redis() -> Result<(), Box<dyn std::error::Error>> {
+let client = WasiRedisClient::new("redis://127.0.0.1:6379");
+let store = RedisEventStore::<BankAccount, _>::new(client);
+let repo = AsyncRepository::new(store);
+# Ok(())
+# }
+```
+
+Redis pub/sub helpers are notification-only. Consumers should use pub/sub or
+SSE to wake clients, then read durable events or read models for truth.
+
+See [Redis Event Store and Realtime](./redis.md) for the Redis key layout,
+feature flags, runtime clients, counter-app commands, and current limitations.

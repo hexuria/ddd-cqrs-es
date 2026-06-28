@@ -23,6 +23,7 @@ chrono = ["dep:chrono"]
 tracing = ["dep:tracing"]
 postgres = ["json", "dep:postgres"]
 sqlite = ["json", "dep:rusqlite"]
+redis = ["json", "async"]
 wasm = ["uuid/js"]
 wasi-http = ["dep:wasip3", "dep:http", "dep:http-body-util", "dep:bytes", "json"]
 wasi-neon = ["wasi-http"]
@@ -30,6 +31,8 @@ wasi-libsql = ["wasi-http"]
 wasi-postgres-tcp = ["json", "dep:md5", "dep:base64", "dep:pbkdf2", "dep:hmac", "dep:sha2", "dep:rustls", "dep:rustls-rustcrypto", "dep:webpki-roots"]
 spin-sqlite = ["dep:spin-sdk", "json"]
 spin-postgres = ["dep:spin-sdk", "json"]
+spin-redis = ["redis", "dep:spin-sdk", "spin-sdk/redis"]
+wasi-redis = ["redis"]
 wasi-supabase-rpc = ["wasi-http"]
 
 
@@ -59,4 +62,3 @@ webpki-roots = { version = "0.26.3", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-

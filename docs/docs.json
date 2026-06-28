@@ -73,6 +73,7 @@
         "pages": [
           "production/persisted-store",
           "production/persisted-views",
+          "production/redis",
           "production/metadata",
           "production/upcasters",
           "production/axum-integration"

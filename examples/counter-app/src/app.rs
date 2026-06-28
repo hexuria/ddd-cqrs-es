@@ -5,7 +5,9 @@ use leptos_router::*;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "hydrate")]
-use web_sys::window;
+use wasm_bindgen::{closure::Closure, JsCast};
+#[cfg(feature = "hydrate")]
+use web_sys::{window, EventSource, MessageEvent};
 
 #[allow(dead_code)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -22,6 +24,15 @@ pub struct EventLogDto {
 pub struct CounterViewDto {
     pub count: i32,
     pub latest_events: Vec<EventLogDto>,
+    pub last_sequence: u64,
+    pub realtime_enabled: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CounterRealtimeMessage {
+    pub view: CounterViewDto,
+    pub last_sequence: u64,
 }
 
 #[cfg(feature = "ssr")]
@@ -77,21 +88,13 @@ fn HomePage() -> impl IntoView {
 
     let (custom_amount, set_custom_amount) = signal(5);
 
-    // Reactive counter view resource
-    let counter_view = Resource::new(
-        move || {
-            (
-                increment_action.version().get(),
-                decrement_action.version().get(),
-                reset_action.version().get(),
-            )
-        },
-        |_| get_counter_view()
-    );
-
+    let counter_view = Resource::new(|| (), |_| get_counter_view());
+    let (current_view, set_current_view) = signal(None::<CounterViewDto>);
     let (optimistic_count, set_optimistic_count) = signal(None::<i32>);
+    let (last_seen_sequence, set_last_seen_sequence) = signal(0_u64);
+    let _ = last_seen_sequence;
 
-    // Handle LocalStorage cache or syncing of resource
+    // Hydrate from local cache while the first server read is in flight.
     Effect::new(move |_| {
         if optimistic_count.get().is_none() {
             #[cfg(feature = "hydrate")]
@@ -101,22 +104,14 @@ fn HomePage() -> impl IntoView {
                         if let Ok(Some(cached_count_str)) = storage.get_item("counter_app_count") {
                             if let Ok(cached_count) = cached_count_str.parse::<i32>() {
                                 set_optimistic_count.set(Some(cached_count));
-                                return;
                             }
                         }
-                    }
-                }
-            }
-
-            if let Some(Ok(view_data)) = counter_view.get() {
-                let server_count = view_data.count;
-                set_optimistic_count.set(Some(server_count));
-
-                #[cfg(feature = "hydrate")]
-                {
-                    if let Some(window) = window() {
-                        if let Ok(Some(storage)) = window.local_storage() {
-                            let _ = storage.set_item("counter_app_count", &server_count.to_string());
+                        if let Ok(Some(cached_sequence_str)) =
+                            storage.get_item("counter_app_last_sequence")
+                        {
+                            if let Ok(cached_sequence) = cached_sequence_str.parse::<u64>() {
+                                set_last_seen_sequence.set(cached_sequence);
+                            }
                         }
                     }
                 }
@@ -126,22 +121,95 @@ fn HomePage() -> impl IntoView {
 
     Effect::new(move |_| {
         if let Some(Ok(view_data)) = counter_view.get() {
-            let server_count = view_data.count;
-            if let Some(current_optimistic) = optimistic_count.get() {
-                if server_count != current_optimistic {
-                    set_optimistic_count.set(Some(server_count));
-                }
-            }
+            set_optimistic_count.set(Some(view_data.count));
+            set_last_seen_sequence.set(view_data.last_sequence);
+            set_current_view.set(Some(view_data.clone()));
 
             #[cfg(feature = "hydrate")]
             {
                 if let Some(window) = window() {
                     if let Ok(Some(storage)) = window.local_storage() {
-                        let _ = storage.set_item("counter_app_count", &server_count.to_string());
+                        let _ = storage.set_item("counter_app_count", &view_data.count.to_string());
+                        let _ = storage
+                            .set_item("counter_app_last_sequence", &view_data.last_sequence.to_string());
                     }
                 }
             }
         }
+    });
+
+    Effect::new(move |_| {
+        let mut next_view = None::<CounterViewDto>;
+        for candidate in [
+            increment_action.value().get(),
+            decrement_action.value().get(),
+            reset_action.value().get(),
+        ] {
+            if let Some(Ok(view_data)) = candidate {
+                if next_view
+                    .as_ref()
+                    .is_none_or(|current| view_data.last_sequence >= current.last_sequence)
+                {
+                    next_view = Some(view_data);
+                }
+            }
+        }
+
+        if let Some(view_data) = next_view {
+            set_optimistic_count.set(Some(view_data.count));
+            set_last_seen_sequence.set(view_data.last_sequence);
+            set_current_view.set(Some(view_data.clone()));
+
+            #[cfg(feature = "hydrate")]
+            {
+                if let Some(window) = window() {
+                    if let Ok(Some(storage)) = window.local_storage() {
+                        let _ = storage.set_item("counter_app_count", &view_data.count.to_string());
+                        let _ = storage
+                            .set_item("counter_app_last_sequence", &view_data.last_sequence.to_string());
+                    }
+                }
+            }
+        }
+    });
+
+    #[cfg(feature = "hydrate")]
+    Effect::new(move |_| {
+        let Some(Ok(view_data)) = counter_view.get() else {
+            return;
+        };
+        if !view_data.realtime_enabled {
+            return;
+        }
+        let url = format!("/api/counter/stream?last_sequence={}", view_data.last_sequence);
+        let Ok(source) = EventSource::new(&url) else {
+            return;
+        };
+        let onmessage = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+            let Some(payload) = event.data().as_string() else {
+                return;
+            };
+            let Ok(message) = serde_json::from_str::<CounterRealtimeMessage>(&payload) else {
+                return;
+            };
+            set_optimistic_count.set(Some(message.view.count));
+            set_last_seen_sequence.set(message.last_sequence);
+            set_current_view.set(Some(message.view.clone()));
+
+            if let Some(window) = window() {
+                if let Ok(Some(storage)) = window.local_storage() {
+                    let _ = storage.set_item("counter_app_count", &message.view.count.to_string());
+                    let _ = storage
+                        .set_item("counter_app_last_sequence", &message.last_sequence.to_string());
+                }
+            }
+        });
+        let callback = onmessage.as_ref().unchecked_ref();
+        source.set_onmessage(Some(callback));
+        let _ = source.add_event_listener_with_callback("counter", callback);
+        onmessage.forget();
+        let cleanup_source = source.clone();
+        Owner::on_cleanup(move || cleanup_source.close());
     });
 
     let display_count = move || {
@@ -379,66 +447,53 @@ fn HomePage() -> impl IntoView {
                     </p>
 
                     <div class="space-y-3 overflow-y-auto pr-1 flex-1">
-                        <Suspense fallback=move || view! {
-                            <div class="text-center text-xs text-slate-500 py-10 font-mono">
-                                "Polling ledger stream..."
-                            </div>
-                        }>
-                            {move || {
-                                counter_view.get().map(|res| {
-                                    match res {
-                                        Ok(view_data) => {
-                                            let logs = view_data.latest_events;
-                                            if logs.is_empty() {
+                        {move || {
+                            match current_view.get() {
+                                None => view! {
+                                    <div class="text-center text-xs text-slate-500 py-10 font-mono">
+                                        "Polling ledger stream..."
+                                    </div>
+                                }.into_any(),
+                                Some(view_data) if view_data.latest_events.is_empty() => view! {
+                                    <div class="text-center text-xs text-slate-500 py-16 font-mono border border-dashed border-slate-800 rounded-xl">
+                                        "No events committed yet."
+                                    </div>
+                                }.into_any(),
+                                Some(view_data) => {
+                                    let logs = view_data.latest_events;
+                                    view! {
+                                        <div class="space-y-3">
+                                            {logs.into_iter().map(|log| {
+                                                let event_style = match log.event_type.as_str() {
+                                                    "incremented" => "bg-sky-500/10 border-sky-500/20 text-sky-400",
+                                                    "decremented" => "bg-slate-800 border-slate-700/60 text-slate-300",
+                                                    _ => "bg-amber-500/10 border-amber-500/20 text-amber-400",
+                                                };
                                                 view! {
-                                                    <div class="text-center text-xs text-slate-500 py-16 font-mono border border-dashed border-slate-800 rounded-xl">
-                                                        "No events committed yet."
+                                                    <div class="p-3 bg-slate-900/60 rounded-xl border border-slate-800/80 flex flex-col gap-1.5 transition-all hover:bg-slate-900 font-mono text-[11px]">
+                                                        <div class="flex justify-between items-center">
+                                                            <span class=format!("px-2 py-0.5 rounded-full font-bold text-[9px] uppercase border {}", event_style)>
+                                                                {log.event_type}
+                                                            </span>
+                                                            <span class="text-slate-500 text-[10px] font-bold">
+                                                                "#" {log.sequence}
+                                                            </span>
+                                                        </div>
+                                                        <div class="flex justify-between text-slate-400">
+                                                            <span>"Revision: " <strong class="text-slate-300">{log.revision}</strong></span>
+                                                            <span class="text-slate-500">{log.recorded_at}</span>
+                                                        </div>
+                                                        <div class="text-slate-400 truncate bg-slate-950/40 p-1.5 rounded border border-slate-900/60 text-[10px] text-left">
+                                                            "Payload: " <code class="text-slate-300">{log.payload}</code>
+                                                        </div>
                                                     </div>
-                                                }.into_any()
-                                            } else {
-                                                view! {
-                                                    <div class="space-y-3">
-                                                        {logs.into_iter().map(|log| {
-                                                            let event_style = match log.event_type.as_str() {
-                                                                "incremented" => "bg-sky-500/10 border-sky-500/20 text-sky-400",
-                                                                "decremented" => "bg-slate-800 border-slate-700/60 text-slate-300",
-                                                                _ => "bg-amber-500/10 border-amber-500/20 text-amber-400",
-                                                            };
-                                                            view! {
-                                                                <div class="p-3 bg-slate-900/60 rounded-xl border border-slate-800/80 flex flex-col gap-1.5 transition-all hover:bg-slate-900 font-mono text-[11px]">
-                                                                    <div class="flex justify-between items-center">
-                                                                        <span class=format!("px-2 py-0.5 rounded-full font-bold text-[9px] uppercase border {}", event_style)>
-                                                                            {log.event_type}
-                                                                        </span>
-                                                                        <span class="text-slate-500 text-[10px] font-bold">
-                                                                            "#" {log.sequence}
-                                                                        </span>
-                                                                    </div>
-                                                                    <div class="flex justify-between text-slate-400">
-                                                                        <span>"Revision: " <strong class="text-slate-300">{log.revision}</strong></span>
-                                                                        <span class="text-slate-500">{log.recorded_at}</span>
-                                                                    </div>
-                                                                    <div class="text-slate-400 truncate bg-slate-950/40 p-1.5 rounded border border-slate-900/60 text-[10px] text-left">
-                                                                        "Payload: " <code class="text-slate-300">{log.payload}</code>
-                                                                    </div>
-                                                                </div>
-                                                            }
-                                                        }).collect_view()}
-                                                    </div>
-                                                }.into_any()
-                                            }
-                                        }
-                                        Err(e) => {
-                                            view! {
-                                                <div class="text-center text-xs text-red-400 py-16 font-mono border border-red-950/20 bg-red-950/5 rounded-xl">
-                                                    "Failed to load ledger: " {e.to_string()}
-                                                </div>
-                                            }.into_any()
-                                        }
-                                    }
-                                })
-                            }}
-                        </Suspense>
+                                                }
+                                            }).collect_view()}
+                                        </div>
+                                    }.into_any()
+                                }
+                            }
+                        }}
                     </div>
                 </div>
 
@@ -471,7 +526,7 @@ pub async fn get_counter_view_db() -> Result<CounterViewDto, ServerFnError> {
 }
 
 #[cfg(feature = "ssr")]
-async fn run_cqrs_command(command: crate::domain::CounterCommand) -> Result<(), ServerFnError> {
+async fn run_cqrs_command(command: crate::domain::CounterCommand) -> Result<CounterViewDto, ServerFnError> {
     use crate::store::{MultiBackendEventStore, MultiBackendCheckpointStore, MultiBackendCounterProjection};
     use crate::domain::{Counter, CounterId};
     use ddd_cqrs_es::AsyncRepository;
@@ -512,7 +567,10 @@ async fn run_cqrs_command(command: crate::domain::CounterCommand) -> Result<(), 
         }
     }
 
-    if contiguous && !committed_events.is_empty() {
+    if crate::store::get_backend() == "redis" {
+        crate::store::run_projections_async(&event_store, &checkpoint_store, &mut projection).await
+            .map_err(ServerFnError::new)?;
+    } else if contiguous && !committed_events.is_empty() {
         for env in &committed_events {
             projection.apply_async(env).await
                 .map_err(|e| ServerFnError::new(e.to_string()))?;
@@ -525,7 +583,10 @@ async fn run_cqrs_command(command: crate::domain::CounterCommand) -> Result<(), 
             .map_err(|e| ServerFnError::new(e))?;
     }
 
-    Ok(())
+    let view = get_counter_view_db().await?;
+    crate::store::publish_counter_realtime(&view).await;
+
+    Ok(view)
 }
 
 
@@ -542,7 +603,7 @@ pub async fn get_counter_view() -> Result<CounterViewDto, ServerFnError> {
 }
 
 #[server(prefix = "/api")]
-pub async fn increment_count(amount: i32) -> Result<(), ServerFnError> {
+pub async fn increment_count(amount: i32) -> Result<CounterViewDto, ServerFnError> {
     #[cfg(feature = "ssr")]
     {
         if amount <= 0 {
@@ -558,7 +619,7 @@ pub async fn increment_count(amount: i32) -> Result<(), ServerFnError> {
 }
 
 #[server(prefix = "/api")]
-pub async fn decrement_count(amount: i32) -> Result<(), ServerFnError> {
+pub async fn decrement_count(amount: i32) -> Result<CounterViewDto, ServerFnError> {
     #[cfg(feature = "ssr")]
     {
         if amount <= 0 {
@@ -574,7 +635,7 @@ pub async fn decrement_count(amount: i32) -> Result<(), ServerFnError> {
 }
 
 #[server(prefix = "/api")]
-pub async fn reset_count() -> Result<(), ServerFnError> {
+pub async fn reset_count() -> Result<CounterViewDto, ServerFnError> {
     #[cfg(feature = "ssr")]
     {
         run_cqrs_command(crate::domain::CounterCommand::Reset).await

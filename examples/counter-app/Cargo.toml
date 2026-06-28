@@ -23,11 +23,12 @@ leptos_wasi = { version = "0.3.1", default-features = false, features = ["wasip3
 server_fn = { version = "0.8.12", features = ["axum-no-default"] }
 spin-sdk = { version = "6.0.0", optional = true }
 http = "1.1.0"
+http-body = { version = "1.0", optional = true }
 http-body-util = { version = "0.1.2", optional = true }
 wasip3 = { version = "0.6.0", features = ["http-compat"], optional = true }
 wit-bindgen = { version = "0.57.1", features = ["inter-task-wakeup"], optional = true }
 wasm-bindgen = { version = "=0.2.125", optional = true }
-web-sys = { version = "0.3", features = ["Storage", "Window"], optional = true }
+web-sys = { version = "0.3", features = ["EventSource", "EventTarget", "MessageEvent", "Storage", "Window"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 md5 = "0.7"
@@ -55,6 +56,7 @@ ssr = [
   "dep:leptos_wasi",
   "dep:wasip3",
   "dep:wit-bindgen",
+  "dep:http-body",
   "dep:http-body-util",
 ]
 sqlite = [
@@ -86,6 +88,19 @@ libsql = [
 supabase = [
   "ssr",
   "ddd_cqrs_es/wasi-supabase-rpc",
+]
+redis = [
+  "ssr",
+  "ddd_cqrs_es/redis",
+]
+spin-redis = [
+  "redis",
+  "dep:spin-sdk",
+  "ddd_cqrs_es/spin-redis",
+]
+wasi-redis = [
+  "redis",
+  "ddd_cqrs_es/wasi-redis",
 ]
 
 [profile.wasm-release]

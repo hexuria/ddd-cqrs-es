@@ -2,6 +2,7 @@ use crate::error::EventStoreError;
 use crate::{ConcurrencyError, ExpectedRevision};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) fn validate_table_name(table_name: &str) -> Result<(), EventStoreError> {
     let mut chars = table_name.chars();
     let Some(first) = chars.next() else {

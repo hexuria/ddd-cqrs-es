@@ -1007,8 +1007,12 @@ cp examples/counter-app/.env.example examples/counter-app/.env
 Open `examples/counter-app/.env` and inspect the configuration variables. This file is tracked by version control as a reference, enabling seamless collaboration and automated testing across local and cloud environments:
 
 ```ini
-# Supported make backends: sqlite, postgres, neon, supabase, turso
+# Supported make backends: sqlite, postgres, neon, supabase, turso, redis
 DATABASE_BACKEND=sqlite
+
+# Realtime transport: off, polling, redis
+REALTIME_BACKEND=off
+REDIS_CHANNEL=counter-events
 
 # make derives DATABASE_URL/DATABASE_AUTH_TOKEN from the backend-specific
 # values below before launching Spin or Wasmtime.
@@ -1034,6 +1038,11 @@ SUPABASE_SECRET_KEY=
 # =========================================================================
 TURSO_URL=
 TURSO_AUTH_TOKEN=
+
+# =========================================================================
+# 5. Redis Settings (experimental event store and realtime notifications)
+# =========================================================================
+REDIS_URL=redis://127.0.0.1:6379
 ```
 
 ---
@@ -1062,6 +1071,7 @@ flowchart TD
     NeonPostgres["⚡ Neon Serverless (Outbound HTTP)"]:::storage
     SupabaseDB["⚡ Supabase REST (Outbound HTTP)"]:::storage
     TursoLibSql["🌀 Turso/LibSQL (Hrana HTTP)"]:::storage
+    RedisStore["Redis Event Store + Notifications"]:::storage
     JsonFile["📂 JSON Flat-File (WASM Directory Mount)"]:::storage
 
     %% Relationships
@@ -1073,6 +1083,7 @@ flowchart TD
     Router -->|"DATABASE_BACKEND = neon"| NeonPostgres
     Router -->|"DATABASE_BACKEND = supabase"| SupabaseDB
     Router -->|"DATABASE_BACKEND = libsql"| TursoLibSql
+    Router -->|"DATABASE_BACKEND = redis"| RedisStore
     Router -->|"DATABASE_BACKEND = sqlite (under Wasmtime)"| JsonFile
 ```
 
@@ -1085,6 +1096,7 @@ flowchart TD
 | **`neon`** | Stateless HTTP SQL | JSON over HTTP (WASIp3) | **Wasmtime** & **Fermyon Spin** | Serverless cloud databases with cold-start mitigation |
 | **`supabase`** | Stateless REST | JSON REST over HTTP (WASIp3) | **Wasmtime** & **Fermyon Spin** | Rapid prototyping, managed Supabase database integration |
 | **`libsql`** / **`turso`** | Hrana Protocol | Pipeline HTTP (WASIp3) | **Wasmtime** & **Fermyon Spin** | Globally distributed SQL, SQLite-at-the-edge (Turso) |
+| **`redis`** | Async Redis commands | RESP TCP under Wasmtime, Spin Redis outbound and optional Redis Trigger under Spin | **Wasmtime** & **Fermyon Spin** | Experimental event persistence, checkpoints, and realtime notifications |
 | **`sqlite`** (Wasmtime) | JSON Flat-File Fallback | POSIX File I/O | **Wasmtime** (mounted volume) | Zero-dependency local testing without external servers |
 
 ---
@@ -1203,6 +1215,9 @@ make wasmtime db=supabase
 
 # Compile and run connected to Turso/LibSQL DB over Hrana HTTP
 make wasmtime db=turso
+
+# Compile and run with the experimental Redis event store and SSE notifications
+make wasmtime db=redis realtime=redis
 ```
 
 ### 2. Build and Run under Fermyon Spin (Microservices Runtime)
@@ -1215,6 +1230,9 @@ make spin
 
 # Compile and run with native Spin PostgreSQL database connector
 make spin db=postgres
+
+# Compile and run with Spin Redis persistence and SSE notifications
+make spin db=redis realtime=redis
 ```
 
 Once launched, open your web browser to `http://127.0.0.1:3000` to interact with your secure, full-stack, optimistic-updating, Event-Sourced Leptos application!
@@ -1229,5 +1247,6 @@ By separating **Domain Logic** (commands, aggregate invariants, and events) from
 *   Want to run your microservice as a lightweight, zero-dependency serverless edge component? **Set `DATABASE_BACKEND=sqlite`**.
 *   Need to scale to enterprise workloads on AWS with thousands of events per second? **Enable `DATABASE_BACKEND=postgres`**.
 *   Want to run globally distributed edge containers with serverless SQL backends? **Set `DATABASE_BACKEND=neon` or `DATABASE_BACKEND=turso`**.
+*   Want experimental Redis-backed event persistence and faster cross-client UI wakeups? **Set `DATABASE_BACKEND=redis` and `REALTIME_BACKEND=redis`**.
 
 Your domain logic does not change by a single letter. That is the outstanding power of building enterprise-grade systems with clean, decoupled **Domain-Driven Design** and **Event Sourcing**!

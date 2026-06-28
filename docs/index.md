@@ -25,13 +25,18 @@ Our framework is highly modular. You can enable specific adapters and engines de
 The stable built-in durable adapters are SQLite and PostgreSQL. Runtime-specific
 WASI, Spin, Neon, LibSQL, and Supabase flags expose lower-level query helpers
 for examples and experiments until they implement the library's reusable event
-store, checkpoint store, and idempotency store contracts.
+store, checkpoint store, and idempotency store contracts. Redis exposes an
+experimental async event store, checkpoint store, and pub/sub notification
+surface.
 
 | Feature | Description | Third-Party Dependencies |
 | :--- | :--- | :--- |
 | **`default`** | Standard local, thread-safe in-memory event store and memory projection runners. | None |
 | **`sqlite`** | Stable SQLite event store, checkpoint store, and idempotency store. | `rusqlite` |
 | **`postgres`** | Stable PostgreSQL event store, checkpoint store, and idempotency store. | `postgres` |
+| **`redis`** | Experimental async Redis event store, checkpoint store, pub/sub publisher, and command executor trait. | None |
+| **`wasi-redis`** | Experimental raw RESP Redis client for generic Wasmtime/WASI runtimes. | `redis` |
+| **`spin-redis`** | Experimental Spin SDK Redis client. | `spin-sdk` |
 | **`wasi-http`** | Experimental outbound HTTP helper foundation for WASI runtimes. | `wasip3`, `http`, `http-body-util`, `bytes` |
 | **`wasi-neon`** | Experimental Neon HTTP SQL query helper. | `wasi-http` |
 | **`wasi-libsql`** | Experimental LibSQL/Turso Hrana HTTP query helper. | `wasi-http` |
@@ -92,11 +97,10 @@ We structured our guides as a structured, chronological path designed to take yo
 * **What you'll learn:** Assemble your domain parts. Wire up the local [InMemoryEventStore](./config-app/event-store.md), write a custom [Query Projection](./config-app/simple-query.md), and [Assemble them together](./config-app/assembly.md) into a working execution loop.
 
 ### Module 5: [Building an Application](./production/persisted-store.md) (Production)
-* **What you'll learn:** Move to production. Deploy durable [SQLite and PostgreSQL stores](./production/persisted-store.md), configure asynchronous [Projections with Checkpoint tracking](./production/persisted-views.md), attach [Metadata trace headers](./production/metadata.md), write custom [Event Upcasters](./production/upcasters.md) for schema evolution, and [Integrate with Web Frameworks (Axum)](./production/axum-integration.md).
+* **What you'll learn:** Move to production. Deploy durable [SQLite and PostgreSQL stores](./production/persisted-store.md), configure asynchronous [Projections with Checkpoint tracking](./production/persisted-views.md), use experimental [Redis persistence and realtime notifications](./production/redis.md), attach [Metadata trace headers](./production/metadata.md), write custom [Event Upcasters](./production/upcasters.md) for schema evolution, and [Integrate with Web Frameworks (Axum)](./production/axum-integration.md).
 
 ### Module 6: [Leptos WASM SSR + Spin SQLite CQRS](./tutorial/leptos-ssr.md) (Full-Stack Showcase)
 * **What you'll learn:** Put everything together. Architect a full-stack, real-time-like reactive UI inside a WebAssembly server-side rendered (SSR) Leptos application deployed to Fermyon Spin. Learn how to write custom WASM SQLite store adapters, checkpointed projections, and reactive forms with optimistic updates.
 
 ### Module 7: [Runtimes & Cloud Deployment (Spin vs. Wasmtime)](./wasmtime-vs-spin-comparison.md)
 * **What you'll learn:** Production runtimes and connection engineering. Understand the performance differences between Wasmtime CLI and Fermyon Spin connection pooling. Read our best practice architectural recommendations for database proximity, and learn how to deploy serverless WASM applications to Fermyon Cloud and SpinKube on AWS EKS, GCP GKE, and Azure AKS.
-

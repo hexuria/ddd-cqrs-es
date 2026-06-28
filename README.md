@@ -18,13 +18,20 @@ ddd_cqrs_es = { path = "../ddd" }
 To enable durable database adapters:
 * **SQLite Support:** Enable the `"sqlite"` feature.
 * **PostgreSQL Support:** Enable the `"postgres"` feature.
+* **Redis Support:** Enable the `"redis"` feature plus `"wasi-redis"` or
+  `"spin-redis"` for experimental async Redis persistence and notification
+  helpers.
 
 The stable built-in SQL adapters are `SqliteEventStore`,
 `PostgresEventStore`, `SqliteCheckpointStore`, `PostgresCheckpointStore`,
 `SqliteIdempotencyStore`, and `PostgresIdempotencyStore`. WASI, Spin, Neon,
 LibSQL, and Supabase feature flags currently expose lower-level query helpers
 for examples and runtime experiments; they are not first-class reusable event
-store/checkpoint store backends yet.
+store/checkpoint store backends yet. Redis exposes an experimental async
+`RedisEventStore`, `RedisCheckpointStore`, and `RedisPubSubPublisher`; pub/sub
+is notification-only and durable event replay remains the source of truth. The
+counter example includes a separate Spin Redis Trigger sidecar for subscriber
+smoke testing; it is not part of the root library API.
 
 ---
 
@@ -56,8 +63,9 @@ Our documentation is structured around explaining core theoretical concepts and 
 ### 5. Building an Application
 * [**5.1. Persisted Event Store**](./docs/production/persisted-store.md) — Connect SQLite and PostgreSQL adapters with Optimistic Concurrency Control (OCC).
 * [**5.2. Queries with Persisted Views**](./docs/production/persisted-views.md) — Manage multi-process projections asynchronously using checkpoint sequence offsets.
-* [**5.3. Including Metadata**](./docs/production/metadata.md) — Attach correlation, causation, actor, and tenant headers for enterprise audit tracing.
-* [**5.4. Event Upcasters**](./docs/production/upcasters.md) — Handle live event schema evolution smoothly using `EventUpcaster` byte transforms.
+* [**5.3. Redis Event Store and Realtime**](./docs/production/redis.md) — Use the experimental async Redis event store, checkpoint store, and notification-only pub/sub publisher.
+* [**5.4. Including Metadata**](./docs/production/metadata.md) — Attach correlation, causation, actor, and tenant headers for enterprise audit tracing.
+* [**5.5. Event Upcasters**](./docs/production/upcasters.md) — Handle live event schema evolution smoothly using `EventUpcaster` byte transforms.
 
 ---
 

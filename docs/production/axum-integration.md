@@ -1,5 +1,5 @@
 ---
-title: 5.5. Integration with Web Frameworks (Axum)
+title: 5.6. Integration with Web Frameworks (Axum)
 description: Build a production-grade, asynchronous REST API on top of your event-sourced domain using Axum.
 ---
 

@@ -8,10 +8,11 @@ ifneq (,$(wildcard .env))
   export
 endif
 
-# Get db from command-line (db=xyz), fallback to DATABASE_BACKEND from .env, fallback to sqlite.
+# Get db/realtime from command-line, fallback to .env, then defaults.
 
 # Initialize db if not defined on command line.
 db ?= $(if $(DATABASE_BACKEND),$(DATABASE_BACKEND),sqlite)
+realtime ?= $(if $(REALTIME_BACKEND),$(REALTIME_BACKEND),off)
 
 # Map database backend aliases to runtime backend names.
 ifeq ($(db), sqlite)
@@ -35,6 +36,19 @@ endif
 ifeq ($(db), turso)
   DATABASE_BACKEND = turso
 endif
+ifeq ($(db), redis)
+  DATABASE_BACKEND = redis
+endif
+
+ifeq ($(realtime), off)
+  REALTIME_BACKEND = off
+endif
+ifeq ($(realtime), polling)
+  REALTIME_BACKEND = polling
+endif
+ifeq ($(realtime), redis)
+  REALTIME_BACKEND = redis
+endif
 
 # Map database backend to fine-grained Cargo features
 CARGO_FEATURES := ssr
@@ -56,6 +70,21 @@ endif
 ifeq ($(DATABASE_BACKEND), supabase)
   CARGO_FEATURES := ssr,supabase
 endif
+ifeq ($(DATABASE_BACKEND), redis)
+  CARGO_FEATURES := ssr,redis
+endif
+
+SPIN_CARGO_FEATURES := $(CARGO_FEATURES)
+WASMTIME_CARGO_FEATURES := $(CARGO_FEATURES)
+ifneq (,$(filter redis,$(DATABASE_BACKEND) $(REALTIME_BACKEND)))
+  SPIN_CARGO_FEATURES := $(CARGO_FEATURES),spin-redis
+  WASMTIME_CARGO_FEATURES := $(CARGO_FEATURES),wasi-redis
+endif
+
+SPIN_MANIFEST := spin.toml
+ifeq ($(REALTIME_BACKEND), redis)
+  SPIN_MANIFEST := spin.redis.toml
+endif
 
 # Default target
 help:
@@ -67,7 +96,9 @@ help:
 	@echo "Database Selection Options:"
 	@echo "  make wasmtime db=neon      - Run with Neon Postgres HTTP backend"
 	@echo "  make wasmtime db=turso     - Run with Turso LibSQL HTTP backend"
+	@echo "  make wasmtime db=redis realtime=redis - Run with Redis event store and SSE notifications"
 	@echo "  make spin db=postgres      - Run with Spin native Postgres backend"
+	@echo "  make spin db=redis realtime=redis - Run with Spin Redis event store, SSE, and Redis trigger"
 	@echo "  make db=neon fresh         - Reset active database tables without starting the app"
 
 # Run target alias
@@ -83,6 +114,7 @@ db-reset:
 		neon) DATABASE_URL_VALUE="$$NEON_DB_URL" ;; \
 		libsql|turso) DATABASE_URL_VALUE="$$TURSO_URL"; DATABASE_AUTH_TOKEN_VALUE="$$TURSO_AUTH_TOKEN" ;; \
 		supabase) DATABASE_URL_VALUE="$$SUPABASE_URL"; DATABASE_AUTH_TOKEN_VALUE="$$SUPABASE_SECRET_KEY" ;; \
+		redis) DATABASE_URL_VALUE="$$REDIS_URL" ;; \
 	esac; \
 	DATABASE_BACKEND=$(DATABASE_BACKEND) DATABASE_URL="$$DATABASE_URL_VALUE" DATABASE_AUTH_TOKEN="$$DATABASE_AUTH_TOKEN_VALUE" ./scripts/reset_db.sh
 
@@ -91,38 +123,51 @@ fresh: db-reset
 
 # Build and run with Spin
 spin:
-	@echo "Building for Spin runtime with DB: $(DATABASE_BACKEND)..."
+	@echo "Building for Spin runtime with DB: $(DATABASE_BACKEND), realtime: $(REALTIME_BACKEND)..."
 	@mkdir -p .spin
-	WASI_RUNTIME=spin DATABASE_BACKEND=$(DATABASE_BACKEND) cargo leptos build --release --lib-features hydrate --bin-features $(CARGO_FEATURES)
-	WASI_RUNTIME=spin DATABASE_BACKEND=$(DATABASE_BACKEND) LEPTOS_OUTPUT_NAME=counter_app cargo build --lib --target wasm32-wasip2 --release --no-default-features --features $(CARGO_FEATURES)
+	WASI_RUNTIME=spin DATABASE_BACKEND=$(DATABASE_BACKEND) REALTIME_BACKEND=$(REALTIME_BACKEND) cargo leptos build --release --lib-features hydrate --bin-features $(SPIN_CARGO_FEATURES)
+	WASI_RUNTIME=spin DATABASE_BACKEND=$(DATABASE_BACKEND) REALTIME_BACKEND=$(REALTIME_BACKEND) LEPTOS_OUTPUT_NAME=counter_app cargo build --lib --target wasm32-wasip2 --release --no-default-features --features $(SPIN_CARGO_FEATURES)
+	@if [ "$(REALTIME_BACKEND)" = "redis" ]; then \
+		cargo build --manifest-path redis-trigger/Cargo.toml --target wasm32-wasip2 --release; \
+	fi
 	@echo "Built: target/wasm32-wasip2/release/counter_app.wasm (for Spin)"
 	@echo "Starting Spin..."
 	@DATABASE_URL_VALUE=""; \
 	DATABASE_AUTH_TOKEN_VALUE=""; \
+	REDIS_URL_VALUE="$${REDIS_URL:-redis://127.0.0.1:6379}"; \
+	REDIS_CHANNEL_VALUE="$${REDIS_CHANNEL:-counter-events}"; \
+	SPIN_VARIABLE_FLAGS=""; \
 	case "$(DATABASE_BACKEND)" in \
 		postgres) DATABASE_URL_VALUE="$$POSTGRES_URL" ;; \
 		neon) DATABASE_URL_VALUE="$$NEON_DB_URL" ;; \
 		libsql|turso) DATABASE_URL_VALUE="$$TURSO_URL"; DATABASE_AUTH_TOKEN_VALUE="$$TURSO_AUTH_TOKEN" ;; \
 		supabase) DATABASE_URL_VALUE="$$SUPABASE_URL"; DATABASE_AUTH_TOKEN_VALUE="$$SUPABASE_SECRET_KEY" ;; \
+		redis) DATABASE_URL_VALUE="$$REDIS_URL_VALUE" ;; \
 	esac; \
-	spin up --env DATABASE_BACKEND=$(DATABASE_BACKEND) --env DATABASE_URL="$$DATABASE_URL_VALUE" --env DATABASE_AUTH_TOKEN="$$DATABASE_AUTH_TOKEN_VALUE"
+	if [ "$(REALTIME_BACKEND)" = "redis" ]; then \
+		SPIN_VARIABLE_FLAGS="--variable redis_url=$$REDIS_URL_VALUE --variable redis_channel=$$REDIS_CHANNEL_VALUE"; \
+	fi; \
+	spin up --from $(SPIN_MANIFEST) --env DATABASE_BACKEND=$(DATABASE_BACKEND) --env DATABASE_URL="$$DATABASE_URL_VALUE" --env DATABASE_AUTH_TOKEN="$$DATABASE_AUTH_TOKEN_VALUE" --env REALTIME_BACKEND=$(REALTIME_BACKEND) --env REDIS_URL="$$REDIS_URL_VALUE" --env REDIS_CHANNEL="$$REDIS_CHANNEL_VALUE" $$SPIN_VARIABLE_FLAGS
 
 # Build and run with Wasmtime
 wasmtime:
-	@echo "Building for Wasmtime runtime with DB: $(DATABASE_BACKEND)..."
-	WASI_RUNTIME=wasmtime DATABASE_BACKEND=$(DATABASE_BACKEND) cargo leptos build --release --lib-features hydrate --bin-features $(CARGO_FEATURES)
-	WASI_RUNTIME=wasmtime DATABASE_BACKEND=$(DATABASE_BACKEND) LEPTOS_OUTPUT_NAME=counter_app cargo build --lib --target wasm32-wasip2 --release --no-default-features --features $(CARGO_FEATURES) --target-dir target/wasmtime
+	@echo "Building for Wasmtime runtime with DB: $(DATABASE_BACKEND), realtime: $(REALTIME_BACKEND)..."
+	WASI_RUNTIME=wasmtime DATABASE_BACKEND=$(DATABASE_BACKEND) REALTIME_BACKEND=$(REALTIME_BACKEND) cargo leptos build --release --lib-features hydrate --bin-features $(WASMTIME_CARGO_FEATURES)
+	WASI_RUNTIME=wasmtime DATABASE_BACKEND=$(DATABASE_BACKEND) REALTIME_BACKEND=$(REALTIME_BACKEND) LEPTOS_OUTPUT_NAME=counter_app cargo build --lib --target wasm32-wasip2 --release --no-default-features --features $(WASMTIME_CARGO_FEATURES) --target-dir target/wasmtime
 	@echo "Built: target/wasmtime/wasm32-wasip2/release/counter_app.wasm (for Wasmtime)"
 	@echo "Starting Wasmtime serve..."
 	@echo "Serving at http://127.0.0.1:3000"
 	@mkdir -p ./data
 	@DATABASE_URL_VALUE=""; \
 	DATABASE_AUTH_TOKEN_VALUE=""; \
+	REDIS_URL_VALUE="$${REDIS_URL:-redis://127.0.0.1:6379}"; \
+	REDIS_CHANNEL_VALUE="$${REDIS_CHANNEL:-counter-events}"; \
 	case "$(DATABASE_BACKEND)" in \
 		postgres) DATABASE_URL_VALUE="$$POSTGRES_URL" ;; \
 		neon) DATABASE_URL_VALUE="$$NEON_DB_URL" ;; \
 		libsql|turso) DATABASE_URL_VALUE="$$TURSO_URL"; DATABASE_AUTH_TOKEN_VALUE="$$TURSO_AUTH_TOKEN" ;; \
 		supabase) DATABASE_URL_VALUE="$$SUPABASE_URL"; DATABASE_AUTH_TOKEN_VALUE="$$SUPABASE_SECRET_KEY" ;; \
+		redis) DATABASE_URL_VALUE="$$REDIS_URL_VALUE" ;; \
 	esac; \
 	wasmtime serve \
 		-W component-model-async=y \
@@ -140,6 +185,9 @@ wasmtime:
 		--env=DATABASE_BACKEND=$(DATABASE_BACKEND) \
 		--env=DATABASE_URL="$$DATABASE_URL_VALUE" \
 		--env=DATABASE_AUTH_TOKEN="$$DATABASE_AUTH_TOKEN_VALUE" \
+		--env=REALTIME_BACKEND=$(REALTIME_BACKEND) \
+		--env=REDIS_URL="$$REDIS_URL_VALUE" \
+		--env=REDIS_CHANNEL="$$REDIS_CHANNEL_VALUE" \
 		--addr 127.0.0.1:3000 \
 		target/wasmtime/wasm32-wasip2/release/counter_app.wasm
 

@@ -1,0 +1,52 @@
+spin_manifest_version = 2
+
+[application]
+name = "counter-app"
+version = "0.1.0"
+authors = ["codeitlikemiley <codeitlikemiley@gmail.com>"]
+description = "A Leptos application running as a WASIp3 Component on Spin with a Redis trigger"
+
+[variables]
+redis_url = { default = "redis://127.0.0.1:6379" }
+redis_channel = { default = "counter-events" }
+
+[application.trigger.redis]
+address = "{{ redis_url }}"
+
+[[trigger.http]]
+route = "/..."
+component = "counter-app"
+executor = { type = "http" }
+
+[[trigger.redis]]
+channel = "{{ redis_channel }}"
+component = "counter-app-redis-trigger"
+
+[component.counter-app]
+source = "target/wasm32-wasip2/release/counter_app.wasm"
+allowed_outbound_hosts = ["*://*.turso.io:*", "*://*.neon.tech:*", "*://*.supabase.co:*", "*://localhost:*", "*://127.0.0.1:*", "{{ redis_url }}"]
+key_value_stores = ["default"]
+sqlite_databases = ["default"]
+files = [
+  { source = "Cargo.toml", destination = "/Cargo.toml" }
+]
+
+[component.counter-app.build]
+command = "WASI_RUNTIME=spin DATABASE_BACKEND=redis REALTIME_BACKEND=redis cargo leptos build --release --lib-features hydrate --bin-features ssr,redis,spin-redis && WASI_RUNTIME=spin DATABASE_BACKEND=redis REALTIME_BACKEND=redis LEPTOS_OUTPUT_NAME=counter_app cargo build --lib --target wasm32-wasip2 --release --no-default-features --features ssr,redis,spin-redis"
+watch = ["src/**/*.rs", "Cargo.toml"]
+
+[component.counter-app-redis-trigger]
+source = "redis-trigger/target/wasm32-wasip2/release/counter_app_redis_trigger.wasm"
+allowed_outbound_hosts = ["{{ redis_url }}"]
+
+[component.counter-app-redis-trigger.build]
+command = "cargo build --manifest-path redis-trigger/Cargo.toml --target wasm32-wasip2 --release"
+watch = ["redis-trigger/src/**/*.rs", "redis-trigger/Cargo.toml"]
+
+[[trigger.http]]
+route = "/pkg/..."
+component = "counter-app-pkg"
+
+[component.counter-app-pkg]
+source = { url = "https://github.com/fermyon/spin-fileserver/releases/download/v0.1.0/spin_static_fs.wasm", digest = "sha256:96c76d9af86420b39eb6cd7be5550e3cb5d4cc4de572ce0fd1f6a29471536cb4" }
+files = [{ source = "target/site/pkg", destination = "/" }]

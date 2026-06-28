@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
-use ddd_cqrs_es::{Aggregate, EventEnvelope, EventId, ExpectedRevision, NewEvent};
+use ddd_cqrs_es::{Aggregate, AsyncCheckpointStore, EventEnvelope, EventId, ExpectedRevision, NewEvent};
 use ddd_cqrs_es::error::EventStoreError;
 use ddd_cqrs_es::async_api::AsyncEventStore;
 use async_trait::async_trait;
@@ -58,6 +58,101 @@ pub fn get_turso_url() -> String {
 
 pub fn get_turso_auth_token() -> Option<String> {
     env_non_empty("DATABASE_AUTH_TOKEN").or_else(|| env_non_empty("TURSO_AUTH_TOKEN"))
+}
+
+pub fn get_redis_url() -> String {
+    env_non_empty("REDIS_URL").unwrap_or_else(|| "redis://127.0.0.1:6379".to_string())
+}
+
+pub fn get_redis_channel() -> String {
+    env_non_empty("REDIS_CHANNEL").unwrap_or_else(|| "counter-events".to_string())
+}
+
+#[cfg(feature = "redis")]
+fn redis_realtime_suffix() -> String {
+    hex_encode(get_redis_channel().as_bytes())
+}
+
+#[cfg(feature = "redis")]
+fn redis_realtime_subscribers_key() -> String {
+    format!("counter:realtime:{}:subscribers", redis_realtime_suffix())
+}
+
+#[cfg(feature = "redis")]
+fn redis_realtime_queue_key(subscriber_id: &str) -> String {
+    format!(
+        "counter:realtime:{}:queue:{}",
+        redis_realtime_suffix(),
+        subscriber_id
+    )
+}
+
+#[cfg(feature = "redis")]
+fn redis_realtime_alive_key(queue_key: &str) -> String {
+    format!("{queue_key}:alive")
+}
+
+pub fn get_realtime_backend() -> String {
+    env_non_empty("REALTIME_BACKEND").unwrap_or_else(|| "off".to_string())
+}
+
+#[cfg(all(feature = "spin-redis", runtime_spin))]
+fn redis_client() -> ddd_cqrs_es::SpinRedisClient {
+    ddd_cqrs_es::SpinRedisClient::new(get_redis_url())
+}
+
+#[cfg(all(feature = "wasi-redis", runtime_wasmtime))]
+fn redis_client() -> ddd_cqrs_es::WasiRedisClient {
+    ddd_cqrs_es::WasiRedisClient::new(get_redis_url())
+}
+
+fn redis_read_model_key(aggregate_id_json: &str) -> String {
+    format!("counter:read_model:{}", hex_encode(aggregate_id_json.as_bytes()))
+}
+
+#[cfg(feature = "redis")]
+fn redis_checkpoint_key(projection_name: &str) -> String {
+    format!(
+        "ddd_cqrs_es:checkpoint:{}",
+        hex_encode(projection_name.as_bytes())
+    )
+}
+
+#[cfg(feature = "redis")]
+const REDIS_COUNTER_PROJECTION_LUA: &str = r#"
+local sequence = tonumber(ARGV[1])
+local operation = ARGV[2]
+local amount = tonumber(ARGV[3])
+local current = tonumber(redis.call('GET', KEYS[2]) or '0')
+
+if sequence <= current then
+    return {'SKIP', current}
+end
+
+if sequence ~= current + 1 then
+    return {'ERR', 'checkpoint_gap', current}
+end
+
+if operation == 'incr' then
+    redis.call('INCRBY', KEYS[1], amount)
+elseif operation == 'set' then
+    redis.call('SET', KEYS[1], amount)
+else
+    return {'ERR', 'unknown_operation', current}
+end
+
+redis.call('SET', KEYS[2], sequence)
+return {'OK', sequence}
+"#;
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 // -------------------------------------------------------------------------
@@ -382,7 +477,17 @@ pub async fn initialize_schema_async() -> Result<(), String> {
 
     let backend = get_backend();
 
-    if backend == "sqlite" {
+    if backend == "redis" {
+        #[cfg(feature = "redis")]
+        {
+            SCHEMA_INITIALIZED.store(true, Ordering::Release);
+            return Ok(());
+        }
+        #[cfg(not(feature = "redis"))]
+        {
+            return Err("redis feature not enabled".to_string());
+        }
+    } else if backend == "sqlite" {
         #[cfg(runtime_spin)]
         {
             #[cfg(feature = "sqlite")]
@@ -464,6 +569,33 @@ where
     async fn load(&self, aggregate_id: &A::Id) -> Result<Vec<EventEnvelope<A::Event, A::Id>>, Self::Error> {
         let backend = get_backend();
 
+        if backend == "redis" {
+            #[cfg(feature = "redis")]
+            {
+                #[cfg(any(
+                    all(feature = "spin-redis", runtime_spin),
+                    all(feature = "wasi-redis", runtime_wasmtime)
+                ))]
+                {
+                    let store = ddd_cqrs_es::RedisEventStore::<A, _>::new(redis_client());
+                    return store.load(aggregate_id).await;
+                }
+                #[cfg(not(any(
+                    all(feature = "spin-redis", runtime_spin),
+                    all(feature = "wasi-redis", runtime_wasmtime)
+                )))]
+                {
+                    return Err(EventStoreError::Backend(
+                        "redis backend requires WASI_RUNTIME=spin or WASI_RUNTIME=wasmtime".to_string(),
+                    ));
+                }
+            }
+            #[cfg(not(feature = "redis"))]
+            {
+                return Err(EventStoreError::Backend("redis feature not enabled".to_string()));
+            }
+        }
+
         if backend == "sqlite" {
             #[cfg(runtime_spin)]
             {
@@ -520,6 +652,33 @@ where
         events: Vec<NewEvent<A::Event>>,
     ) -> Result<Vec<EventEnvelope<A::Event, A::Id>>, Self::Error> {
         let backend = get_backend();
+
+        if backend == "redis" {
+            #[cfg(feature = "redis")]
+            {
+                #[cfg(any(
+                    all(feature = "spin-redis", runtime_spin),
+                    all(feature = "wasi-redis", runtime_wasmtime)
+                ))]
+                {
+                    let store = ddd_cqrs_es::RedisEventStore::<A, _>::new(redis_client());
+                    return store.append(aggregate_id, expected_revision, events).await;
+                }
+                #[cfg(not(any(
+                    all(feature = "spin-redis", runtime_spin),
+                    all(feature = "wasi-redis", runtime_wasmtime)
+                )))]
+                {
+                    return Err(EventStoreError::Backend(
+                        "redis backend requires WASI_RUNTIME=spin or WASI_RUNTIME=wasmtime".to_string(),
+                    ));
+                }
+            }
+            #[cfg(not(feature = "redis"))]
+            {
+                return Err(EventStoreError::Backend("redis feature not enabled".to_string()));
+            }
+        }
 
         if backend == "sqlite" {
             #[cfg(runtime_spin)]
@@ -730,6 +889,33 @@ where
         let backend = get_backend();
         let seq = sequence.unwrap_or(0);
 
+        if backend == "redis" {
+            #[cfg(feature = "redis")]
+            {
+                #[cfg(any(
+                    all(feature = "spin-redis", runtime_spin),
+                    all(feature = "wasi-redis", runtime_wasmtime)
+                ))]
+                {
+                    let store = ddd_cqrs_es::RedisEventStore::<A, _>::new(redis_client());
+                    return store.load_global_after(sequence).await;
+                }
+                #[cfg(not(any(
+                    all(feature = "spin-redis", runtime_spin),
+                    all(feature = "wasi-redis", runtime_wasmtime)
+                )))]
+                {
+                    return Err(EventStoreError::Backend(
+                        "redis backend requires WASI_RUNTIME=spin or WASI_RUNTIME=wasmtime".to_string(),
+                    ));
+                }
+            }
+            #[cfg(not(feature = "redis"))]
+            {
+                return Err(EventStoreError::Backend("redis feature not enabled".to_string()));
+            }
+        }
+
         if backend == "sqlite" {
             #[cfg(runtime_spin)]
             {
@@ -785,6 +971,33 @@ impl MultiBackendCheckpointStore {
 
     pub async fn load_checkpoint_async(&self, projection_name: &str) -> Result<Option<u64>, EventStoreError> {
         let backend = get_backend();
+
+        if backend == "redis" {
+            #[cfg(feature = "redis")]
+            {
+                #[cfg(any(
+                    all(feature = "spin-redis", runtime_spin),
+                    all(feature = "wasi-redis", runtime_wasmtime)
+                ))]
+                {
+                    let store = ddd_cqrs_es::RedisCheckpointStore::new(redis_client());
+                    return store.load_checkpoint(projection_name).await;
+                }
+                #[cfg(not(any(
+                    all(feature = "spin-redis", runtime_spin),
+                    all(feature = "wasi-redis", runtime_wasmtime)
+                )))]
+                {
+                    return Err(EventStoreError::Backend(
+                        "redis checkpoint store requires WASI_RUNTIME=spin or WASI_RUNTIME=wasmtime".to_string(),
+                    ));
+                }
+            }
+            #[cfg(not(feature = "redis"))]
+            {
+                return Err(EventStoreError::Backend("redis feature not enabled".to_string()));
+            }
+        }
 
         if backend == "sqlite" {
             #[cfg(runtime_spin)]
@@ -842,6 +1055,33 @@ impl MultiBackendCheckpointStore {
     pub async fn save_checkpoint_async(&self, projection_name: &str, sequence: u64) -> Result<(), EventStoreError> {
         let backend = get_backend();
 
+        if backend == "redis" {
+            #[cfg(feature = "redis")]
+            {
+                #[cfg(any(
+                    all(feature = "spin-redis", runtime_spin),
+                    all(feature = "wasi-redis", runtime_wasmtime)
+                ))]
+                {
+                    let store = ddd_cqrs_es::RedisCheckpointStore::new(redis_client());
+                    return store.save_checkpoint(projection_name, sequence).await;
+                }
+                #[cfg(not(any(
+                    all(feature = "spin-redis", runtime_spin),
+                    all(feature = "wasi-redis", runtime_wasmtime)
+                )))]
+                {
+                    return Err(EventStoreError::Backend(
+                        "redis checkpoint store requires WASI_RUNTIME=spin or WASI_RUNTIME=wasmtime".to_string(),
+                    ));
+                }
+            }
+            #[cfg(not(feature = "redis"))]
+            {
+                return Err(EventStoreError::Backend("redis feature not enabled".to_string()));
+            }
+        }
+
         if backend == "sqlite" {
             #[cfg(runtime_spin)]
             {
@@ -898,6 +1138,66 @@ impl MultiBackendCounterProjection {
             .map_err(|e| EventStoreError::Serialization(e.to_string()))?;
             
         let backend = get_backend();
+
+        if backend == "redis" {
+            #[cfg(feature = "redis")]
+            {
+                #[cfg(any(
+                    all(feature = "spin-redis", runtime_spin),
+                    all(feature = "wasi-redis", runtime_wasmtime)
+                ))]
+                {
+                    use ddd_cqrs_es::RedisCommandExecutor;
+
+                    let client = redis_client();
+                    let key = redis_read_model_key(&aggregate_id_str);
+                    match envelope.payload {
+                        crate::domain::CounterEvent::Incremented { amount } => {
+                            client
+                                .execute(
+                                    "INCRBY",
+                                    vec![key.into_bytes(), amount.to_string().into_bytes()],
+                                )
+                                .await
+                                .map_err(|e| EventStoreError::Backend(e.to_string()))?;
+                        }
+                        crate::domain::CounterEvent::Decremented { amount } => {
+                            let delta = -amount;
+                            client
+                                .execute(
+                                    "INCRBY",
+                                    vec![key.into_bytes(), delta.to_string().into_bytes()],
+                                )
+                                .await
+                                .map_err(|e| EventStoreError::Backend(e.to_string()))?;
+                        }
+                        crate::domain::CounterEvent::ResetPerformed { value } => {
+                            client
+                                .execute(
+                                    "SET",
+                                    vec![key.into_bytes(), value.to_string().into_bytes()],
+                                )
+                                .await
+                                .map_err(|e| EventStoreError::Backend(e.to_string()))?;
+                        }
+                    }
+                    return Ok(());
+                }
+                #[cfg(not(any(
+                    all(feature = "spin-redis", runtime_spin),
+                    all(feature = "wasi-redis", runtime_wasmtime)
+                )))]
+                {
+                    return Err(EventStoreError::Backend(
+                        "redis projection requires WASI_RUNTIME=spin or WASI_RUNTIME=wasmtime".to_string(),
+                    ));
+                }
+            }
+            #[cfg(not(feature = "redis"))]
+            {
+                return Err(EventStoreError::Backend("redis feature not enabled".to_string()));
+            }
+        }
         
         if backend == "sqlite" {
             #[cfg(runtime_spin)]
@@ -1006,6 +1306,67 @@ fn value_as_u64(value: &serde_json::Value) -> Option<u64> {
         .or_else(|| value.as_str().and_then(|v| v.parse::<u64>().ok()))
 }
 
+#[cfg(feature = "redis")]
+fn redis_value_as_i64(value: &ddd_cqrs_es::redis::RedisValue) -> Option<i64> {
+    match value {
+        ddd_cqrs_es::redis::RedisValue::Int(value) => Some(*value),
+        ddd_cqrs_es::redis::RedisValue::Bytes(bytes) => {
+            std::str::from_utf8(bytes).ok()?.parse::<i64>().ok()
+        }
+        ddd_cqrs_es::redis::RedisValue::Status(value) => value.parse::<i64>().ok(),
+        ddd_cqrs_es::redis::RedisValue::Array(values) if values.len() == 1 => {
+            redis_value_as_i64(&values[0])
+        }
+        _ => None,
+    }
+}
+
+#[cfg(feature = "redis")]
+fn redis_value_as_string(value: &ddd_cqrs_es::redis::RedisValue) -> Option<String> {
+    match value {
+        ddd_cqrs_es::redis::RedisValue::Bytes(bytes) => {
+            String::from_utf8(bytes.clone()).ok()
+        }
+        ddd_cqrs_es::redis::RedisValue::Status(value) => Some(value.clone()),
+        ddd_cqrs_es::redis::RedisValue::Int(value) => Some(value.to_string()),
+        ddd_cqrs_es::redis::RedisValue::Array(values) if values.len() == 1 => {
+            redis_value_as_string(&values[0])
+        }
+        _ => None,
+    }
+}
+
+#[cfg(feature = "redis")]
+fn ensure_redis_projection_result(
+    value: &ddd_cqrs_es::redis::RedisValue,
+) -> Result<(), String> {
+    let ddd_cqrs_es::redis::RedisValue::Array(items) = value else {
+        return Err(format!("Redis projection script returned {value:?}"));
+    };
+    let status = items
+        .first()
+        .and_then(redis_value_as_string)
+        .ok_or_else(|| format!("Redis projection script returned {value:?}"))?;
+
+    match status.as_str() {
+        "OK" | "SKIP" => Ok(()),
+        "ERR" => {
+            let reason = items
+                .get(1)
+                .and_then(redis_value_as_string)
+                .unwrap_or_else(|| "unknown".to_string());
+            let checkpoint = items
+                .get(2)
+                .and_then(redis_value_as_i64)
+                .map_or_else(|| "?".to_string(), |value| value.to_string());
+            Err(format!(
+                "Redis projection script failed: {reason} at checkpoint {checkpoint}"
+            ))
+        }
+        _ => Err(format!("unknown Redis projection status `{status}`")),
+    }
+}
+
 fn row_count(row: &serde_json::Value) -> i32 {
     row.get("count")
         .or_else(|| row.get("value"))
@@ -1047,6 +1408,25 @@ fn event_log_from_row(row: &serde_json::Value) -> crate::app::EventLogDto {
     }
 }
 
+fn event_log_from_envelope(
+    envelope: &EventEnvelope<crate::domain::CounterEvent, crate::domain::CounterId>,
+) -> crate::app::EventLogDto {
+    let payload = serde_json::to_string(&envelope.payload).unwrap_or_default();
+    let recorded_at_ms = envelope
+        .recorded_at
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default();
+
+    crate::app::EventLogDto {
+        sequence: envelope.sequence.unwrap_or(0),
+        event_type: envelope.event_type.clone(),
+        revision: envelope.revision,
+        payload,
+        recorded_at: format!("+{}ms", recorded_at_ms % 100000),
+    }
+}
+
 fn event_logs_from_value(value: Option<&serde_json::Value>) -> Result<Vec<crate::app::EventLogDto>, String> {
     let Some(value) = value else {
         return Ok(Vec::new());
@@ -1071,12 +1451,15 @@ fn event_logs_from_value(value: Option<&serde_json::Value>) -> Result<Vec<crate:
 pub async fn get_counter_view_db() -> Result<crate::app::CounterViewDto, String> {
     let backend = get_backend();
 
-    if backend == "sqlite" {
+    if backend == "sqlite" || backend == "redis" {
         let count = get_count_db().await?;
         let latest_events = get_latest_events_db().await?;
+        let last_sequence = latest_events.first().map(|event| event.sequence).unwrap_or(0);
         return Ok(crate::app::CounterViewDto {
             count,
             latest_events,
+            last_sequence,
+            realtime_enabled: get_realtime_backend() != "off",
         });
     }
 
@@ -1128,17 +1511,58 @@ pub async fn get_counter_view_db() -> Result<crate::app::CounterViewDto, String>
         return Ok(crate::app::CounterViewDto {
             count: 0,
             latest_events: Vec::new(),
+            last_sequence: 0,
+            realtime_enabled: get_realtime_backend() != "off",
         });
     };
+    let latest_events = event_logs_from_value(row.get("latest_events"))?;
+    let last_sequence = latest_events.first().map(|event| event.sequence).unwrap_or(0);
 
     Ok(crate::app::CounterViewDto {
         count: row_count(row),
-        latest_events: event_logs_from_value(row.get("latest_events"))?,
+        latest_events,
+        last_sequence,
+        realtime_enabled: get_realtime_backend() != "off",
     })
 }
 
 pub async fn get_count_db() -> Result<i32, String> {
     let backend = get_backend();
+
+    if backend == "redis" {
+        #[cfg(feature = "redis")]
+        {
+            #[cfg(any(
+                    all(feature = "spin-redis", runtime_spin),
+                    all(feature = "wasi-redis", runtime_wasmtime)
+                ))]
+            {
+                use ddd_cqrs_es::RedisCommandExecutor;
+
+                let aggregate_id = crate::domain::CounterId("global".to_string());
+                let aggregate_id_str = serde_json::to_string(&aggregate_id).map_err(|e| e.to_string())?;
+                let key = redis_read_model_key(&aggregate_id_str);
+                let value = redis_client()
+                    .execute("GET", vec![key.into_bytes()])
+                    .await
+                    .map_err(|e| e.to_string())?;
+                return Ok(redis_value_as_i64(&value)
+                    .and_then(|value| i32::try_from(value).ok())
+                    .unwrap_or(0));
+            }
+            #[cfg(not(any(
+                    all(feature = "spin-redis", runtime_spin),
+                    all(feature = "wasi-redis", runtime_wasmtime)
+                )))]
+            {
+                return Err("redis count query requires WASI_RUNTIME=spin or WASI_RUNTIME=wasmtime".to_string());
+            }
+        }
+        #[cfg(not(feature = "redis"))]
+        {
+            return Err("redis feature not enabled".to_string());
+        }
+    }
     
     if backend == "sqlite" {
         #[cfg(runtime_spin)]
@@ -1187,6 +1611,24 @@ pub async fn get_count_db() -> Result<i32, String> {
 
 pub async fn get_latest_events_db() -> Result<Vec<crate::app::EventLogDto>, String> {
     let backend = get_backend();
+
+    if backend == "redis" {
+        #[cfg(feature = "redis")]
+        {
+            let event_store = MultiBackendEventStore::<crate::domain::Counter>::new();
+            let mut events = event_store
+                .load_global_after(None)
+                .await
+                .map_err(|e| e.to_string())?;
+            events.sort_by_key(|event| event.sequence.unwrap_or(0));
+            events.reverse();
+            return Ok(events.iter().take(5).map(event_log_from_envelope).collect());
+        }
+        #[cfg(not(feature = "redis"))]
+        {
+            return Err("redis feature not enabled".to_string());
+        }
+    }
     
     if backend == "sqlite" {
         #[cfg(runtime_spin)]
@@ -1239,12 +1681,87 @@ pub async fn get_latest_events_db() -> Result<Vec<crate::app::EventLogDto>, Stri
 // -------------------------------------------------------------------------
 // ASYNC COORDINATOR FOR PROJECTIONS RUNNER
 // -------------------------------------------------------------------------
+#[cfg(any(all(feature = "spin-redis", runtime_spin), all(feature = "wasi-redis", runtime_wasmtime)))]
+async fn apply_redis_counter_projection_atomically(
+    envelope: &EventEnvelope<crate::domain::CounterEvent, crate::domain::CounterId>,
+) -> Result<(), String> {
+    use ddd_cqrs_es::RedisCommandExecutor;
+
+    let sequence = envelope
+        .sequence
+        .ok_or_else(|| "Event envelope is missing global sequence".to_string())?;
+    let aggregate_id_json =
+        serde_json::to_string(&envelope.aggregate_id).map_err(|error| error.to_string())?;
+    let read_model_key = redis_read_model_key(&aggregate_id_json);
+    let checkpoint_key = redis_checkpoint_key("counter_projection");
+    let (operation, amount) = match envelope.payload {
+        crate::domain::CounterEvent::Incremented { amount } => ("incr", i64::from(amount)),
+        crate::domain::CounterEvent::Decremented { amount } => ("incr", -i64::from(amount)),
+        crate::domain::CounterEvent::ResetPerformed { value } => ("set", i64::from(value)),
+    };
+
+    let value = redis_client()
+        .execute(
+            "EVAL",
+            vec![
+                REDIS_COUNTER_PROJECTION_LUA.as_bytes().to_vec(),
+                b"2".to_vec(),
+                read_model_key.into_bytes(),
+                checkpoint_key.into_bytes(),
+                sequence.to_string().into_bytes(),
+                operation.as_bytes().to_vec(),
+                amount.to_string().into_bytes(),
+            ],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+    ensure_redis_projection_result(&value)
+}
+
+#[cfg(any(all(feature = "spin-redis", runtime_spin), all(feature = "wasi-redis", runtime_wasmtime)))]
+async fn run_redis_counter_projection_atomic(
+    event_store: &MultiBackendEventStore<crate::domain::Counter>,
+    checkpoint_store: &MultiBackendCheckpointStore,
+) -> Result<usize, String> {
+    let last_sequence = checkpoint_store
+        .load_checkpoint_async("counter_projection")
+        .await
+        .map_err(|error| error.to_string())?;
+    let envelopes = event_store
+        .load_global_after(last_sequence)
+        .await
+        .map_err(|error| error.to_string())?;
+    let count = envelopes.len();
+
+    for envelope in &envelopes {
+        apply_redis_counter_projection_atomically(envelope).await?;
+    }
+
+    Ok(count)
+}
+
 pub async fn run_projections_async(
     event_store: &MultiBackendEventStore<crate::domain::Counter>,
     checkpoint_store: &MultiBackendCheckpointStore,
     projection: &mut MultiBackendCounterProjection,
 ) -> Result<usize, String> {
     use ddd_cqrs_es::async_api::AsyncEventStore;
+
+    if get_backend() == "redis" {
+        #[cfg(any(all(feature = "spin-redis", runtime_spin), all(feature = "wasi-redis", runtime_wasmtime)))]
+        {
+            let _ = projection;
+            return run_redis_counter_projection_atomic(event_store, checkpoint_store).await;
+        }
+        #[cfg(not(any(all(feature = "spin-redis", runtime_spin), all(feature = "wasi-redis", runtime_wasmtime))))]
+        {
+            return Err(
+                "redis projection requires redis feature and WASI_RUNTIME=spin or WASI_RUNTIME=wasmtime"
+                    .to_string(),
+            );
+        }
+    }
     
     let last_sequence = checkpoint_store.load_checkpoint_async("counter_projection").await
         .map_err(|e| e.to_string())?;
@@ -1270,4 +1787,417 @@ pub async fn run_projections_async(
     }
     
     Ok(count)
+}
+
+#[cfg(any(
+    all(feature = "spin-redis", runtime_spin),
+    all(feature = "wasi-redis", runtime_wasmtime)
+))]
+async fn redis_execute(
+    command: &str,
+    args: Vec<Vec<u8>>,
+) -> Result<ddd_cqrs_es::redis::RedisValue, String> {
+    use ddd_cqrs_es::RedisCommandExecutor;
+
+    redis_client()
+        .execute(command, args)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "redis")]
+fn redis_value_bytes(value: &ddd_cqrs_es::redis::RedisValue) -> Option<Vec<u8>> {
+    match value {
+        ddd_cqrs_es::redis::RedisValue::Bytes(bytes) => Some(bytes.clone()),
+        ddd_cqrs_es::redis::RedisValue::Status(value) => Some(value.as_bytes().to_vec()),
+        ddd_cqrs_es::redis::RedisValue::Int(value) => Some(value.to_string().into_bytes()),
+        ddd_cqrs_es::redis::RedisValue::Array(items) if items.len() == 1 => {
+            redis_value_bytes(&items[0])
+        }
+        ddd_cqrs_es::redis::RedisValue::Nil | ddd_cqrs_es::redis::RedisValue::Array(_) => None,
+    }
+}
+
+#[cfg(feature = "redis")]
+fn redis_value_strings(value: &ddd_cqrs_es::redis::RedisValue) -> Vec<String> {
+    match value {
+        ddd_cqrs_es::redis::RedisValue::Array(items) => items
+            .iter()
+            .filter_map(redis_value_bytes)
+            .filter_map(|bytes| String::from_utf8(bytes).ok())
+            .collect(),
+        value => redis_value_bytes(value)
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .into_iter()
+            .collect(),
+    }
+}
+
+#[cfg(feature = "redis")]
+const REDIS_REALTIME_FANOUT_LUA: &str = r#"
+local subscribers = redis.call('SMEMBERS', KEYS[1])
+local pushed = 0
+
+for _, queue_key in ipairs(subscribers) do
+    local alive_key = queue_key .. ':alive'
+    if redis.call('EXISTS', alive_key) == 1 then
+        redis.call('LPUSH', queue_key, ARGV[1])
+        redis.call('EXPIRE', queue_key, 120)
+        pushed = pushed + 1
+    else
+        redis.call('SREM', KEYS[1], queue_key)
+        redis.call('DEL', queue_key)
+    end
+end
+
+return pushed
+"#;
+
+#[cfg(any(
+    all(feature = "spin-redis", runtime_spin),
+    all(feature = "wasi-redis", runtime_wasmtime)
+))]
+async fn redis_touch_realtime_subscriber(queue_key: &str, alive_key: &str) -> Result<(), String> {
+    redis_execute(
+        "SETEX",
+        vec![
+            alive_key.as_bytes().to_vec(),
+            b"60".to_vec(),
+            b"1".to_vec(),
+        ],
+    )
+    .await?;
+    redis_execute(
+        "SADD",
+        vec![
+            redis_realtime_subscribers_key().as_bytes().to_vec(),
+            queue_key.as_bytes().to_vec(),
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+#[cfg(any(
+    all(feature = "spin-redis", runtime_spin),
+    all(feature = "wasi-redis", runtime_wasmtime)
+))]
+async fn redis_publish_realtime_wake(payload: &[u8]) -> Result<(), String> {
+    let subscribers_key = redis_realtime_subscribers_key();
+    redis_execute(
+        "EVAL",
+        vec![
+            REDIS_REALTIME_FANOUT_LUA.as_bytes().to_vec(),
+            b"1".to_vec(),
+            subscribers_key.as_bytes().to_vec(),
+            payload.to_vec(),
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn publish_counter_realtime(view: &crate::app::CounterViewDto) {
+    if get_realtime_backend() != "redis" {
+        return;
+    }
+
+    #[cfg(feature = "redis")]
+    {
+        #[cfg(any(
+                    all(feature = "spin-redis", runtime_spin),
+                    all(feature = "wasi-redis", runtime_wasmtime)
+                ))]
+        {
+            let message = crate::app::CounterRealtimeMessage {
+                view: view.clone(),
+                last_sequence: view.last_sequence,
+            };
+            let payload = match serde_json::to_vec(&message) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    eprintln!("failed to serialize Redis realtime notification: {error}");
+                    return;
+                }
+            };
+
+            let publisher =
+                ddd_cqrs_es::RedisPubSubPublisher::new(redis_client(), get_redis_channel());
+            if let Err(error) = publisher.publish(&payload).await {
+                eprintln!("failed to publish Redis realtime notification: {error}");
+            }
+            if let Err(error) = redis_publish_realtime_wake(&payload).await {
+                eprintln!("failed to wake Redis realtime SSE subscribers: {error}");
+            }
+        }
+        #[cfg(not(any(
+                    all(feature = "spin-redis", runtime_spin),
+                    all(feature = "wasi-redis", runtime_wasmtime)
+                )))]
+        {
+            eprintln!("redis realtime requires WASI_RUNTIME=spin or WASI_RUNTIME=wasmtime");
+        }
+    }
+    #[cfg(not(feature = "redis"))]
+    {
+        eprintln!("redis realtime requested but redis feature is not enabled");
+    }
+}
+
+pub async fn counter_realtime_message_after(
+    last_sequence: u64,
+) -> Result<Option<crate::app::CounterRealtimeMessage>, String> {
+    let event_store = MultiBackendEventStore::<crate::domain::Counter>::new();
+    let newer_events = event_store
+        .load_global_after(Some(last_sequence))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if newer_events.is_empty() {
+        return Ok(None);
+    }
+
+    let checkpoint_store = MultiBackendCheckpointStore::new();
+    let mut projection = MultiBackendCounterProjection::new();
+    run_projections_async(&event_store, &checkpoint_store, &mut projection).await?;
+
+    let view = get_counter_view_db().await?;
+    Ok(Some(crate::app::CounterRealtimeMessage {
+        last_sequence: view.last_sequence,
+        view,
+    }))
+}
+
+#[cfg(feature = "ssr")]
+struct CounterStreamState {
+    last_sequence: u64,
+    redis_subscriber: Option<CounterRedisSubscriber>,
+    checked_initial_catchup: bool,
+}
+
+#[cfg(feature = "ssr")]
+struct CounterRedisSubscriber {
+    queue_key: String,
+    alive_key: String,
+}
+
+#[cfg(feature = "ssr")]
+impl CounterStreamState {
+    async fn new(last_sequence: u64) -> Self {
+        Self {
+            last_sequence,
+            redis_subscriber: CounterRedisSubscriber::register().await,
+            checked_initial_catchup: false,
+        }
+    }
+
+    fn has_redis_wake(&self) -> bool {
+        self.redis_subscriber.is_some()
+    }
+
+    async fn next_frame(&mut self) -> String {
+        match self.next_message().await {
+            Ok(Some(message)) => counter_sse_frame(&message),
+            Ok(None) => counter_sse_keepalive_frame(),
+            Err(error) => counter_sse_error_frame(&error),
+        }
+    }
+
+    async fn next_poll_frame(&mut self) -> String {
+        match counter_realtime_message_after(self.last_sequence).await {
+            Ok(Some(message)) => {
+                self.last_sequence = message.last_sequence;
+                counter_sse_frame(&message)
+            }
+            Ok(None) => counter_sse_ping_frame(),
+            Err(error) => counter_sse_error_frame(&error),
+        }
+    }
+
+    async fn next_message(&mut self) -> Result<Option<crate::app::CounterRealtimeMessage>, String> {
+        if !self.checked_initial_catchup {
+            self.checked_initial_catchup = true;
+            if let Some(message) = counter_realtime_message_after(self.last_sequence).await? {
+                self.last_sequence = message.last_sequence;
+                return Ok(Some(message));
+            }
+        }
+
+        let Some(subscriber) = &self.redis_subscriber else {
+            return Ok(None);
+        };
+
+        if subscriber.next_payload().await?.is_none() {
+            return Ok(None);
+        }
+
+        let message = counter_realtime_message_after(self.last_sequence).await?;
+        if let Some(message) = &message {
+            self.last_sequence = message.last_sequence;
+        }
+        Ok(message)
+    }
+}
+
+#[cfg(feature = "ssr")]
+impl CounterRedisSubscriber {
+    #[cfg(any(
+        all(feature = "spin-redis", runtime_spin),
+        all(feature = "wasi-redis", runtime_wasmtime)
+    ))]
+    async fn register() -> Option<Self> {
+        if get_realtime_backend() != "redis" {
+            return None;
+        }
+
+        let subscriber_id = EventId::new().as_str().to_owned();
+        let queue_key = redis_realtime_queue_key(&subscriber_id);
+        let alive_key = redis_realtime_alive_key(&queue_key);
+        let subscriber = Self {
+            queue_key,
+            alive_key,
+        };
+
+        if let Err(error) =
+            redis_touch_realtime_subscriber(&subscriber.queue_key, &subscriber.alive_key).await
+        {
+            eprintln!("failed to register Redis realtime SSE subscriber: {error}");
+            return None;
+        }
+
+        Some(subscriber)
+    }
+
+    #[cfg(not(any(
+        all(feature = "spin-redis", runtime_spin),
+        all(feature = "wasi-redis", runtime_wasmtime)
+    )))]
+    async fn register() -> Option<Self> {
+        None
+    }
+
+    #[cfg(any(
+        all(feature = "spin-redis", runtime_spin),
+        all(feature = "wasi-redis", runtime_wasmtime)
+    ))]
+    async fn next_payload(&self) -> Result<Option<Vec<u8>>, String> {
+        redis_touch_realtime_subscriber(&self.queue_key, &self.alive_key).await?;
+        let value = redis_execute(
+            "BRPOP",
+            vec![self.queue_key.as_bytes().to_vec(), b"25".to_vec()],
+        )
+        .await?;
+        let items = redis_value_strings(&value);
+        if items.len() < 2 {
+            return Ok(None);
+        }
+        Ok(items.last().map(|payload| payload.as_bytes().to_vec()))
+    }
+
+    #[cfg(not(any(
+        all(feature = "spin-redis", runtime_spin),
+        all(feature = "wasi-redis", runtime_wasmtime)
+    )))]
+    async fn next_payload(&self) -> Result<Option<Vec<u8>>, String> {
+        Ok(None)
+    }
+}
+
+#[cfg(feature = "ssr")]
+fn counter_sse_frame(message: &crate::app::CounterRealtimeMessage) -> String {
+    match serde_json::to_string(message) {
+        Ok(json) => format!("id: {}\nevent: counter\ndata: {json}\n\n", message.last_sequence),
+        Err(error) => counter_sse_error_frame(&error.to_string()),
+    }
+}
+
+#[cfg(feature = "ssr")]
+fn counter_sse_error_frame(error: &str) -> String {
+    format!(
+        "event: error\ndata: {{\"message\":\"{}\"}}\n\n",
+        error.replace('"', "'")
+    )
+}
+
+#[cfg(feature = "ssr")]
+fn counter_sse_ping_frame() -> String {
+    let retry_ms = if get_realtime_backend() == "redis" {
+        250
+    } else {
+        1_000
+    };
+    format!("retry: {retry_ms}\nevent: ping\ndata: {{}}\n\n")
+}
+
+#[cfg(feature = "ssr")]
+fn counter_sse_keepalive_frame() -> String {
+    "retry: 1000\n: keepalive\n\n".to_string()
+}
+
+#[cfg(feature = "ssr")]
+pub async fn counter_stream_response(
+    req: &http::Request<wasip3::http_compat::IncomingRequestBody>,
+) -> Result<
+    http::Response<http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, std::io::Error>>,
+    String,
+> {
+    use http_body_util::BodyExt;
+
+    let last_sequence = req
+        .headers()
+        .get("last-event-id")
+        .and_then(|val| val.to_str().ok())
+        .and_then(|val| val.parse::<u64>().ok())
+        .or_else(|| {
+            req.uri()
+                .query()
+                .and_then(|query| {
+                    query.split('&').find_map(|part| {
+                        let (key, value) = part.split_once('=')?;
+                        (key == "last_sequence")
+                            .then(|| value.parse::<u64>().ok())
+                            .flatten()
+                    })
+                })
+        })
+        .unwrap_or(0);
+
+    let state = CounterStreamState::new(last_sequence).await;
+
+    let stream = if get_realtime_backend() == "redis" && state.has_redis_wake() {
+        let s = futures::stream::unfold(state, |mut state| async move {
+            let frame = state.next_frame().await;
+            Some((
+                Ok::<_, std::io::Error>(http_body::Frame::data(bytes::Bytes::from(frame))),
+                state,
+            ))
+        });
+        Box::pin(s) as std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = Result<http_body::Frame<bytes::Bytes>, std::io::Error>>
+                    + Send,
+            >,
+        >
+    } else {
+        let mut state = state;
+        let frame = state.next_poll_frame().await;
+        let s = futures::stream::once(async move {
+            Ok::<_, std::io::Error>(http_body::Frame::data(bytes::Bytes::from(frame)))
+        });
+        Box::pin(s) as std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = Result<http_body::Frame<bytes::Bytes>, std::io::Error>>
+                    + Send,
+            >,
+        >
+    };
+    let body = http_body_util::StreamBody::new(stream).boxed_unsync();
+
+    http::Response::builder()
+        .status(http::StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "text/event-stream")
+        .header(http::header::CACHE_CONTROL, "no-cache, no-transform")
+        .header("X-Accel-Buffering", "no")
+        .body(body)
+        .map_err(|e| e.to_string())
 }
