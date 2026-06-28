@@ -1089,15 +1089,16 @@ flowchart TD
 
 ### Supported Database Backends Matrix
 
-| Backend Key (`db`) | Connection Model | Network Protocol | Target Runtime Compatibility | Use Cases |
-| :--- | :--- | :--- | :--- | :--- |
-| **`sqlite`** | Local Host-Call | WASM Host Interface | **Fermyon Spin** only | Low-latency local dev, edge microservices |
-| **`postgres`** | Direct Socket Pool | TCP Socket stream | **Fermyon Spin** (via outbound TCP) | Classic high-throughput self-hosted PG |
-| **`neon`** | Stateless HTTP SQL | JSON over HTTP (WASIp3) | **Wasmtime** & **Fermyon Spin** | Serverless cloud databases with cold-start mitigation |
-| **`supabase`** | Stateless REST | JSON REST over HTTP (WASIp3) | **Wasmtime** & **Fermyon Spin** | Rapid prototyping, managed Supabase database integration |
-| **`libsql`** / **`turso`** | Hrana Protocol | Pipeline HTTP (WASIp3) | **Wasmtime** & **Fermyon Spin** | Globally distributed SQL, SQLite-at-the-edge (Turso) |
-| **`redis`** | Async Redis commands | RESP TCP under Wasmtime, Spin Redis outbound and optional Redis Trigger under Spin | **Wasmtime** & **Fermyon Spin** | Experimental event persistence, checkpoints, and realtime notifications |
-| **`sqlite`** (Wasmtime) | JSON Flat-File Fallback | POSIX File I/O | **Wasmtime** (mounted volume) | Zero-dependency local testing without external servers |
+| Backend Key (`db`) | Connection Model | Network Protocol | Target Runtime Compatibility | Use Cases | Realtime Support |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **`sqlite`** | Local Host-Call | WASM Host Interface | **Fermyon Spin** only | Low-latency local dev, edge microservices | Yes (via SSE stream) |
+| **`postgres`** | Direct Socket Pool | TCP Socket stream | **Fermyon Spin** (via outbound TCP) | Classic high-throughput self-hosted PG | Yes (via SSE stream) |
+| **`neon`** | Stateless HTTP SQL | JSON over HTTP (WASIp3) | **Wasmtime** & **Fermyon Spin** | Serverless cloud databases with cold-start mitigation | No |
+| **`supabase`** | Stateless REST | JSON REST over HTTP (WASIp3) | **Wasmtime** & **Fermyon Spin** | Rapid prototyping, managed Supabase database integration | No |
+| **`libsql`** / **`turso`** | Hrana Protocol | Pipeline HTTP (WASIp3) | **Wasmtime** & **Fermyon Spin** | Globally distributed SQL, SQLite-at-the-edge (Turso) | No |
+| **`redis`** | Async Redis commands | RESP TCP under Wasmtime, Spin Redis outbound and optional Redis Trigger under Spin | **Wasmtime** & **Fermyon Spin** | Experimental event persistence, checkpoints, and realtime notifications | Yes (via PubSub / SSE) |
+| **`sqlite`** (Wasmtime) | JSON Flat-File Fallback | POSIX File I/O | **Wasmtime** (mounted volume) | Zero-dependency local testing without external servers | Yes (via SSE stream) |
+| **`mysql`** | *None* | *None* | **Not Supported** | No MySQL support available | No |
 
 ---
 
