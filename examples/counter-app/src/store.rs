@@ -116,6 +116,7 @@ fn redis_client() -> ddd_cqrs_es::SpinRedisClient {
 #[cfg(all(feature = "wasi-redis", runtime_wasmtime))]
 fn redis_client() -> ddd_cqrs_es::WasiRedisClient {
     ddd_cqrs_es::WasiRedisClient::new(get_redis_url())
+        .with_read_timeout(Some(std::time::Duration::from_secs(30)))
 }
 
 #[allow(dead_code)]
