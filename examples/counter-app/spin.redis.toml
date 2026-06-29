@@ -24,7 +24,7 @@ component = "counter-app-redis-trigger"
 
 [component.counter-app]
 source = "target/wasm32-wasip2/release/counter_app.wasm"
-allowed_outbound_hosts = ["*://*.turso.io:*", "*://*.neon.tech:*", "*://*.supabase.co:*", "*://localhost:*", "*://127.0.0.1:*", "{{ redis_url }}"]
+allowed_outbound_hosts = ["*://*.turso.io:*", "*://*.neon.tech:*", "*://*.supabase.co:*", "*://localhost:*", "*://127.0.0.1:*", "mysql://*:*", "{{ redis_url }}"]
 key_value_stores = ["default"]
 sqlite_databases = ["default"]
 files = [

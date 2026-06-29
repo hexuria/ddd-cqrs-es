@@ -1098,7 +1098,7 @@ flowchart TD
 | **`libsql`** / **`turso`** | Hrana Protocol | Pipeline HTTP (WASIp3) | **Wasmtime** & **Fermyon Spin** | Globally distributed SQL, SQLite-at-the-edge (Turso) | No |
 | **`redis`** | Async Redis commands | RESP TCP under Wasmtime, Spin Redis outbound and optional Redis Trigger under Spin | **Wasmtime** & **Fermyon Spin** | Experimental event persistence, checkpoints, and realtime notifications | Yes (via PubSub / SSE) |
 | **`sqlite`** (Wasmtime) | JSON Flat-File Fallback | POSIX File I/O | **Wasmtime** (mounted volume) | Zero-dependency local testing without external servers | Yes (via SSE stream) |
-| **`mysql`** | *None* | *None* | **Not Supported** | No MySQL support available | No |
+| **`mysql`** | Direct Socket | TCP Socket stream on Wasmtime; Spin SDK MySQL host API on Spin; native driver on non-WASI targets | **Wasmtime**, **Fermyon Spin**, and native targets | High-throughput self-hosted or cloud MySQL | App-owned polling or external pub/sub bridge |
 
 ---
 

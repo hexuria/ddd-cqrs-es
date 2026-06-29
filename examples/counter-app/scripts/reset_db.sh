@@ -6,6 +6,38 @@ set -e
 BACKEND="${DATABASE_BACKEND:-sqlite}"
 echo "Resetting database backend: $BACKEND"
 
+url_decode() {
+  local input="${1//+/ }"
+  printf '%b' "${input//%/\\x}"
+}
+
+query_param() {
+  local query="$1"
+  local key="$2"
+  local pair
+  local old_ifs="$IFS"
+  IFS='&'
+  for pair in $query; do
+    case "$pair" in
+      "$key="*) url_decode "${pair#*=}"; IFS="$old_ifs"; return 0 ;;
+    esac
+  done
+  IFS="$old_ifs"
+  return 1
+}
+
+write_mysql_option() {
+  local key="$1"
+  local value="$2"
+  case "$value" in
+    *$'\n'*|*$'\r'*)
+      echo "Error: MySQL URL field for $key contains a newline." >&2
+      exit 1
+      ;;
+  esac
+  printf '%s=%s\n' "$key" "$value"
+}
+
 case "$BACKEND" in
   sqlite)
     echo "Cleaning local SQLite / flat-file data..."
@@ -13,6 +45,136 @@ case "$BACKEND" in
     rm -rf data/*.json
     rm -f data/.schema_initialized_*
     echo "Local SQLite database and markers reset."
+    ;;
+
+  mysql)
+    if [ -z "$DATABASE_URL" ]; then
+      echo "Error: DATABASE_URL environment variable is not set." >&2
+      exit 1
+    fi
+    echo "Resetting MySQL database..."
+
+    URL_NO_SCHEME="${DATABASE_URL#mysql://}"
+    if [ "$URL_NO_SCHEME" = "$DATABASE_URL" ]; then
+      echo "Error: MySQL DATABASE_URL must start with mysql://." >&2
+      exit 1
+    fi
+
+    URL_NO_FRAGMENT="${URL_NO_SCHEME%%#*}"
+    QUERY_STRING=""
+    case "$URL_NO_FRAGMENT" in
+      *\?*) QUERY_STRING="${URL_NO_FRAGMENT#*\?}" ;;
+    esac
+    URL_NO_QUERY="${URL_NO_FRAGMENT%%\?*}"
+    if [ "$URL_NO_QUERY" = "$URL_NO_FRAGMENT" ]; then
+      URL_NO_QUERY="$URL_NO_FRAGMENT"
+    fi
+
+    case "$URL_NO_QUERY" in
+      */*) ;;
+      *)
+        echo "Error: MySQL DATABASE_URL must include a database name." >&2
+        exit 1
+        ;;
+    esac
+
+    USER_PASS_HOST_PORT="${URL_NO_QUERY%%/*}"
+    DB_NAME="$(url_decode "${URL_NO_QUERY#*/}")"
+    USER_PASS="${USER_PASS_HOST_PORT%@*}"
+    HOST_PORT="${USER_PASS_HOST_PORT##*@}"
+
+    if [ "$USER_PASS" = "$USER_PASS_HOST_PORT" ]; then
+      echo "Error: MySQL DATABASE_URL must include user credentials." >&2
+      exit 1
+    fi
+
+    if [[ "$USER_PASS" == *:* ]]; then
+      DB_USER="$(url_decode "${USER_PASS%%:*}")"
+      DB_PASS="$(url_decode "${USER_PASS#*:}")"
+    else
+      DB_USER="$(url_decode "$USER_PASS")"
+      DB_PASS=""
+    fi
+
+    if [[ "$HOST_PORT" == \[*\]* ]]; then
+      DB_HOST="${HOST_PORT%%]*}"
+      DB_HOST="${DB_HOST#[}"
+      HOST_PORT_REMAINDER="${HOST_PORT#*]}"
+      if [[ "$HOST_PORT_REMAINDER" == :* ]]; then
+        DB_PORT="${HOST_PORT_REMAINDER#:}"
+      else
+        DB_PORT=3306
+      fi
+    else
+      DB_HOST="${HOST_PORT%%:*}"
+      DB_PORT="${HOST_PORT#*:}"
+      if [ "$DB_PORT" = "$HOST_PORT" ]; then
+        DB_PORT=3306
+      fi
+    fi
+
+    if [ -z "$DB_USER" ] || [ -z "$DB_HOST" ] || [ -z "$DB_NAME" ]; then
+      echo "Error: MySQL DATABASE_URL must include user, host, and database name." >&2
+      exit 1
+    fi
+    if [ -z "$DB_PORT" ]; then
+      DB_PORT=3306
+    fi
+
+    MYSQL_SSL_MODE="$(query_param "$QUERY_STRING" "ssl-mode" || true)"
+    if [ -z "$MYSQL_SSL_MODE" ]; then
+      MYSQL_SSL_MODE="$(query_param "$QUERY_STRING" "ssl_mode" || true)"
+    fi
+
+    MYSQL_DEFAULTS_FILE="$(mktemp)"
+    trap 'rm -f "$MYSQL_DEFAULTS_FILE"' EXIT
+    chmod 600 "$MYSQL_DEFAULTS_FILE"
+    {
+      echo "[client]"
+      write_mysql_option "user" "$DB_USER"
+      if [ -n "$DB_PASS" ]; then
+        write_mysql_option "password" "$DB_PASS"
+      fi
+      write_mysql_option "host" "$DB_HOST"
+      write_mysql_option "port" "$DB_PORT"
+      if [ -n "$MYSQL_SSL_MODE" ]; then
+        write_mysql_option "ssl-mode" "$MYSQL_SSL_MODE"
+      fi
+    } > "$MYSQL_DEFAULTS_FILE"
+
+    mysql --defaults-extra-file="$MYSQL_DEFAULTS_FILE" "$DB_NAME" <<EOF
+DROP TABLE IF EXISTS events;
+DROP TABLE IF EXISTS checkpoints;
+DROP TABLE IF EXISTS counter_read_model;
+DROP TABLE IF EXISTS schema_migrations;
+DROP TABLE IF EXISTS idempotency_keys;
+
+CREATE TABLE events (
+    sequence BIGINT AUTO_INCREMENT PRIMARY KEY,
+    event_id VARCHAR(255) NOT NULL UNIQUE,
+    aggregate_id VARCHAR(255) NOT NULL,
+    aggregate_type VARCHAR(255) NOT NULL,
+    revision BIGINT NOT NULL,
+    event_type VARCHAR(255) NOT NULL,
+    event_version INT NOT NULL,
+    payload LONGTEXT NOT NULL,
+    metadata LONGTEXT NOT NULL,
+    recorded_at_ms BIGINT NOT NULL,
+    UNIQUE KEY (aggregate_type, aggregate_id, revision),
+    INDEX (aggregate_type, aggregate_id, revision)
+);
+
+CREATE TABLE checkpoints (
+    projection_name VARCHAR(255) PRIMARY KEY,
+    last_sequence BIGINT NOT NULL
+);
+
+CREATE TABLE counter_read_model (
+    id VARCHAR(255) PRIMARY KEY,
+    value BIGINT NOT NULL
+);
+EOF
+    echo "MySQL schema successfully dropped and re-created."
     ;;
 
   postgres|neon)

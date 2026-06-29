@@ -12,6 +12,7 @@ under both raw Wasmtime and Fermyon Spin.
 - **Spin CLI:** Version 4.0.0 or later.
 - **Wasmtime CLI:** Version 45.0.0 or later.
 - **Redis CLI/server:** Optional, only needed for `db=redis` or `realtime=redis`.
+- **MySQL server/client:** Optional, only needed for `db=mysql`.
 
 ## Build and Run
 
@@ -54,8 +55,18 @@ environment variables for you.
 | `make wasmtime db=neon` | Neon HTTP SQL helper. |
 | `make wasmtime db=supabase` | Supabase RPC helper. |
 | `make wasmtime db=turso` | Turso/LibSQL Hrana HTTP helper. |
+| `make wasmtime db=mysql` | Raw TCP MySQL helper using `wasi-mysql`. |
+| `make spin db=mysql realtime=polling` | Spin SDK MySQL helper using `spin-mysql`. |
 | `make wasmtime db=redis realtime=redis` | Experimental Redis event store with SSE notifications. |
 | `make spin db=redis realtime=redis` | Experimental Spin Redis event store with SSE notifications. |
+
+`db=mysql` uses `MYSQL_URL` first, then falls back to `DATABASE_URL`.
+
+```bash
+make db=mysql fresh
+make wasmtime db=mysql
+make spin db=mysql realtime=polling
+```
 
 `db=redis` uses `REDIS_URL`, defaulting to `redis://127.0.0.1:6379`.
 
@@ -140,8 +151,9 @@ Important variables:
 
 | Variable | Values |
 | :--- | :--- |
-| `DATABASE_BACKEND` | `sqlite`, `postgres`, `neon`, `supabase`, `turso`, `redis` |
+| `DATABASE_BACKEND` | `sqlite`, `postgres`, `mysql`, `neon`, `supabase`, `turso`, `redis` |
 | `REALTIME_BACKEND` | `off`, `polling`, `redis` |
+| `MYSQL_URL` | MySQL URL, for example `mysql://user:password@127.0.0.1:3306/counter_app` |
 | `REDIS_URL` | Redis URL, default `redis://127.0.0.1:6379` |
 | `REDIS_CHANNEL` | Redis notification channel, default `counter-events` |
 

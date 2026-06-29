@@ -1,43 +1,41 @@
-//! PostgreSQL event store adapter.
+//! MySQL event store adapter.
 
 use crate::aggregate::Aggregate;
 use crate::error::EventStoreError;
 use crate::event::{EventEnvelope, EventId, ExpectedRevision, NewEvent};
 use crate::event_store::{EventStore, EventStream};
 use crate::idempotency::{IdempotencyKey, IdempotencyState, IdempotencyStore};
+use crate::projection::CheckpointStore;
 use crate::sql_common::{
     check_expected_revision, deserialize_id, deserialize_metadata, deserialize_payload,
     millis_to_system_time, serialize_id, serialize_metadata, serialize_payload,
     system_time_to_millis, validate_table_name,
 };
 use crate::upcast::UpcasterRegistry;
-use ::postgres::{Client, NoTls};
+use mysql::prelude::*;
+use mysql::{Conn, Error as MySqlError, Opts, Row, TxOpts};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-/// PostgreSQL-backed event store.
-///
-/// The adapter stores payloads and metadata as `JSONB`, assigns global sequence
-/// numbers through `BIGSERIAL`, and enforces optimistic concurrency with a
-/// unique `(aggregate_type, aggregate_id, revision)` constraint.
-pub struct PostgresEventStore<A>
+/// MySQL-backed event store.
+pub struct MySqlEventStore<A>
 where
     A: Aggregate,
 {
-    client: Arc<Mutex<Client>>,
+    connection: Arc<Mutex<Conn>>,
     table_name: String,
     upcasters: UpcasterRegistry,
     _marker: PhantomData<fn() -> A>,
 }
 
-impl<A> Clone for PostgresEventStore<A>
+impl<A> Clone for MySqlEventStore<A>
 where
     A: Aggregate,
 {
     fn clone(&self) -> Self {
         Self {
-            client: Arc::clone(&self.client),
+            connection: Arc::clone(&self.connection),
             table_name: self.table_name.clone(),
             upcasters: self.upcasters.clone(),
             _marker: PhantomData,
@@ -45,51 +43,53 @@ where
     }
 }
 
-impl<A> std::fmt::Debug for PostgresEventStore<A>
+impl<A> std::fmt::Debug for MySqlEventStore<A>
 where
     A: Aggregate,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PostgresEventStore")
+        f.debug_struct("MySqlEventStore")
             .field("table_name", &self.table_name)
             .finish_non_exhaustive()
     }
 }
 
-impl<A> PostgresEventStore<A>
+impl<A> MySqlEventStore<A>
 where
     A: Aggregate,
 {
-    /// Connects to PostgreSQL using [`NoTls`] and the default `events` table.
-    pub fn connect(params: &str) -> Result<Self, EventStoreError> {
-        let client = Client::connect(params, NoTls).map_err(map_postgres_error)?;
-        Self::new(client)
+    /// Connects to MySQL using standard URL params and the default `events` table.
+    pub fn connect(url: &str) -> Result<Self, EventStoreError> {
+        let opts = Opts::from_url(url).map_err(|e| EventStoreError::Backend(e.to_string()))?;
+        let conn = Conn::new(opts).map_err(map_mysql_error)?;
+        Self::new(conn)
     }
 
-    /// Connects to PostgreSQL using [`NoTls`] and a custom table name.
+    /// Connects to MySQL using standard URL params and a custom table name.
     pub fn connect_with_table_name(
-        params: &str,
+        url: &str,
         table_name: impl Into<String>,
     ) -> Result<Self, EventStoreError> {
-        let client = Client::connect(params, NoTls).map_err(map_postgres_error)?;
-        Self::with_table_name(client, table_name)
+        let opts = Opts::from_url(url).map_err(|e| EventStoreError::Backend(e.to_string()))?;
+        let conn = Conn::new(opts).map_err(map_mysql_error)?;
+        Self::with_table_name(conn, table_name)
     }
 
-    /// Creates a PostgreSQL event store using the default `events` table.
-    pub fn new(client: Client) -> Result<Self, EventStoreError> {
-        Self::with_table_name(client, "events")
+    /// Creates a MySQL event store using the default `events` table.
+    pub fn new(connection: Conn) -> Result<Self, EventStoreError> {
+        Self::with_table_name(connection, "events")
     }
 
-    /// Creates a PostgreSQL event store with a custom table name.
+    /// Creates a MySQL event store with a custom table name.
     pub fn with_table_name(
-        client: Client,
+        connection: Conn,
         table_name: impl Into<String>,
     ) -> Result<Self, EventStoreError> {
         let table_name = table_name.into();
         validate_table_name(&table_name)?;
 
         Ok(Self {
-            client: Arc::new(Mutex::new(client)),
+            connection: Arc::new(Mutex::new(connection)),
             table_name,
             upcasters: UpcasterRegistry::new(),
             _marker: PhantomData,
@@ -110,22 +110,25 @@ where
         self.upcasters.register(event_type, upcaster);
     }
 
-    /// Migrates the PostgreSQL schemas to the latest version.
+    /// Migrates the MySQL schemas to the latest version.
     pub fn migrate_schema(&self) -> Result<(), EventStoreError> {
-        let config = crate::schema::SqlSchemaConfig::new(crate::schema::SqlDialect::Postgres)
+        let config = crate::schema::SqlSchemaConfig::new(crate::schema::SqlDialect::MySql)
             .with_events_table(&self.table_name);
         let migrator = crate::schema::SchemaMigrator::new(config);
-        let mut client = self.client.lock().map_err(|_| EventStoreError::Poisoned)?;
-        migrator.run_postgres(&mut client)
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| EventStoreError::Poisoned)?;
+        migrator.run_mysql(&mut connection)
     }
 
-    /// Initializes the PostgreSQL event table and indexes.
+    /// Initializes the MySQL event table and indexes.
     pub fn initialize_schema(&self) -> Result<(), EventStoreError> {
         self.migrate_schema()
     }
 }
 
-impl<A> EventStore<A> for PostgresEventStore<A>
+impl<A> EventStore<A> for MySqlEventStore<A>
 where
     A: Aggregate + 'static,
     A::Event: serde::Serialize + serde::de::DeserializeOwned,
@@ -135,16 +138,19 @@ where
 
     fn load(&self, aggregate_id: &A::Id) -> Result<EventStream<A>, Self::Error> {
         let aggregate_id = serialize_id(aggregate_id)?;
-        let mut client = self.client.lock().map_err(|_| EventStoreError::Poisoned)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| EventStoreError::Poisoned)?;
         let query = format!(
             "SELECT event_id, aggregate_id, aggregate_type, revision, sequence, event_type, \
              event_version, payload, metadata, recorded_at_ms FROM {table} \
-             WHERE aggregate_type = $1 AND aggregate_id = $2 ORDER BY revision ASC",
+             WHERE aggregate_type = ? AND aggregate_id = ? ORDER BY revision ASC",
             table = self.table_name
         );
-        let rows = client
-            .query(&query, &[&A::aggregate_type(), &aggregate_id])
-            .map_err(map_postgres_error)?;
+        let rows: Vec<Row> = connection
+            .exec(&query, (A::aggregate_type(), &aggregate_id))
+            .map_err(map_mysql_error)?;
 
         let upcasters = self.upcasters.clone();
         rows.into_iter()
@@ -161,26 +167,32 @@ where
         let aggregate_id_key = serialize_id(aggregate_id)?;
         let prepared = events
             .into_iter()
-            .map(PreparedPostgresEvent::new)
+            .map(PreparedMySqlEvent::new)
             .collect::<Result<Vec<_>, _>>()?;
-        let mut client = self.client.lock().map_err(|_| EventStoreError::Poisoned)?;
-        let mut transaction = client.transaction().map_err(map_postgres_error)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| EventStoreError::Poisoned)?;
+        let mut transaction = connection
+            .start_transaction(TxOpts::default())
+            .map_err(map_mysql_error)?;
+
         let revision_query = format!(
-            "SELECT COALESCE(MAX(revision), 0)::BIGINT FROM {table} \
-             WHERE aggregate_type = $1 AND aggregate_id = $2",
+            "SELECT COALESCE(MAX(revision), 0) FROM {table} \
+             WHERE aggregate_type = ? AND aggregate_id = ?",
             table = self.table_name
         );
         let actual_revision: i64 = transaction
-            .query_one(&revision_query, &[&A::aggregate_type(), &aggregate_id_key])
-            .and_then(|row| row.try_get(0))
-            .map_err(map_postgres_error)?;
+            .exec_first(&revision_query, (A::aggregate_type(), &aggregate_id_key))
+            .map_err(map_mysql_error)?
+            .unwrap_or(0);
         let actual_revision = u64::try_from(actual_revision).map_err(|_| {
             EventStoreError::Deserialization("stored revision cannot be negative".to_owned())
         })?;
         check_expected_revision(expected_revision, actual_revision)?;
 
         if prepared.is_empty() {
-            transaction.commit().map_err(map_postgres_error)?;
+            transaction.commit().map_err(map_mysql_error)?;
             return Ok(Vec::new());
         }
 
@@ -188,7 +200,7 @@ where
             "INSERT INTO {table} \
              (event_id, aggregate_id, aggregate_type, revision, event_type, event_version, \
               payload, metadata, recorded_at_ms) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING sequence",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             table = self.table_name
         );
         let mut committed = Vec::with_capacity(prepared.len());
@@ -199,31 +211,30 @@ where
                 EventStoreError::Serialization("revision exceeds BIGINT".to_owned())
             })?;
             let event_version_i32 = i32::try_from(event.event_version).map_err(|_| {
-                EventStoreError::Serialization("event_version exceeds INT".to_owned())
+                EventStoreError::Serialization("event_version exceeds i32".to_owned())
             })?;
-            let row = transaction
-                .query_one(
+
+            transaction
+                .exec_drop(
                     &insert,
-                    &[
-                        &event.event_id.as_str(),
+                    (
+                        event.event_id.as_str(),
                         &aggregate_id_key,
-                        &A::aggregate_type(),
-                        &revision_i64,
+                        A::aggregate_type(),
+                        revision_i64,
                         &event.event_type,
-                        &event_version_i32,
+                        event_version_i32,
                         &event.payload_json,
                         &event.metadata_json,
-                        &event.recorded_at_ms,
-                    ],
+                        event.recorded_at_ms,
+                    ),
                 )
                 .map_err(|error| {
-                    map_postgres_insert_error(error, expected_revision, actual_revision)
+                    map_mysql_insert_error(error, expected_revision, actual_revision)
                 })?;
-            let sequence: i64 = row.try_get(0).map_err(map_postgres_error)?;
-            let sequence = u64::try_from(sequence).map_err(|_| {
-                EventStoreError::Deserialization(
-                    "PostgreSQL sequence cannot be negative".to_owned(),
-                )
+
+            let sequence = transaction.last_insert_id().ok_or_else(|| {
+                EventStoreError::Backend("MySQL last_insert_id failed".to_owned())
             })?;
 
             committed.push(EventEnvelope::new(
@@ -240,25 +251,28 @@ where
             ));
         }
 
-        transaction.commit().map_err(map_postgres_error)?;
+        transaction.commit().map_err(map_mysql_error)?;
         Ok(committed)
     }
 
     fn load_global_after(&self, sequence: Option<u64>) -> Result<EventStream<A>, Self::Error> {
         let sequence = sequence.unwrap_or_default();
-        let sequence = i64::try_from(sequence).map_err(|_| {
+        let sequence_i64 = i64::try_from(sequence).map_err(|_| {
             EventStoreError::Deserialization("global sequence exceeds BIGINT".to_owned())
         })?;
-        let mut client = self.client.lock().map_err(|_| EventStoreError::Poisoned)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| EventStoreError::Poisoned)?;
         let query = format!(
             "SELECT event_id, aggregate_id, aggregate_type, revision, sequence, event_type, \
              event_version, payload, metadata, recorded_at_ms FROM {table} \
-             WHERE aggregate_type = $1 AND sequence > $2 ORDER BY sequence ASC",
+             WHERE aggregate_type = ? AND sequence > ? ORDER BY sequence ASC",
             table = self.table_name
         );
-        let rows = client
-            .query(&query, &[&A::aggregate_type(), &sequence])
-            .map_err(map_postgres_error)?;
+        let rows: Vec<Row> = connection
+            .exec(&query, (A::aggregate_type(), sequence_i64))
+            .map_err(map_mysql_error)?;
 
         let upcasters = self.upcasters.clone();
         rows.into_iter()
@@ -267,19 +281,63 @@ where
     }
 }
 
-struct PreparedPostgresEvent<E> {
+#[cfg(feature = "async")]
+#[async_trait::async_trait]
+impl<A> crate::async_api::AsyncEventStore<A> for MySqlEventStore<A>
+where
+    A: Aggregate + Send + Sync + 'static,
+    A::Event: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+    A::Id: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+{
+    type Error = EventStoreError;
+
+    async fn load(&self, aggregate_id: &A::Id) -> Result<EventStream<A>, Self::Error> {
+        let this = self.clone();
+        let aggregate_id = aggregate_id.clone();
+        tokio::task::spawn_blocking(move || EventStore::load(&this, &aggregate_id))
+            .await
+            .map_err(|e| EventStoreError::Backend(e.to_string()))?
+    }
+
+    async fn append(
+        &self,
+        aggregate_id: &A::Id,
+        expected_revision: ExpectedRevision,
+        events: Vec<NewEvent<A::Event>>,
+    ) -> Result<EventStream<A>, Self::Error> {
+        let this = self.clone();
+        let aggregate_id = aggregate_id.clone();
+        tokio::task::spawn_blocking(move || {
+            EventStore::append(&this, &aggregate_id, expected_revision, events)
+        })
+        .await
+        .map_err(|e| EventStoreError::Backend(e.to_string()))?
+    }
+
+    async fn load_global_after(
+        &self,
+        sequence: Option<u64>,
+    ) -> Result<EventStream<A>, Self::Error> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || EventStore::load_global_after(&this, sequence))
+            .await
+            .map_err(|e| EventStoreError::Backend(e.to_string()))?
+    }
+}
+
+struct PreparedMySqlEvent<E> {
     event_id: EventId,
     event_type: String,
     event_version: u32,
     payload: E,
-    payload_json: serde_json::Value,
+    payload_json: String,
     metadata: crate::Metadata,
-    metadata_json: serde_json::Value,
+    metadata_json: String,
     recorded_at: SystemTime,
     recorded_at_ms: i64,
 }
 
-impl<E> PreparedPostgresEvent<E>
+impl<E> PreparedMySqlEvent<E>
 where
     E: serde::Serialize,
 {
@@ -287,8 +345,8 @@ where
         let event_id = EventId::new();
         let recorded_at = SystemTime::now();
         let recorded_at_ms = system_time_to_millis(recorded_at)?;
-        let payload_json = serialize_payload(&event.payload)?;
-        let metadata_json = serialize_metadata(&event.metadata)?;
+        let payload_json = serialize_payload(&event.payload)?.to_string();
+        let metadata_json = serialize_metadata(&event.metadata)?.to_string();
 
         Ok(Self {
             event_id,
@@ -306,34 +364,54 @@ where
 
 fn row_to_envelope<A>(
     upcasters: &UpcasterRegistry,
-    row: ::postgres::Row,
+    row: Row,
 ) -> Result<EventEnvelope<A::Event, A::Id>, EventStoreError>
 where
     A: Aggregate,
     A::Event: serde::de::DeserializeOwned,
     A::Id: serde::de::DeserializeOwned,
 {
-    let event_id: String = row.try_get(0).map_err(map_postgres_error)?;
-    let aggregate_id: String = row.try_get(1).map_err(map_postgres_error)?;
-    let aggregate_type: String = row.try_get(2).map_err(map_postgres_error)?;
-    let revision: i64 = row.try_get(3).map_err(map_postgres_error)?;
-    let sequence: i64 = row.try_get(4).map_err(map_postgres_error)?;
-    let event_type: String = row.try_get(5).map_err(map_postgres_error)?;
-    let event_version: i32 = row.try_get(6).map_err(map_postgres_error)?;
-    let payload_val: serde_json::Value = row.try_get(7).map_err(map_postgres_error)?;
-    let metadata: serde_json::Value = row.try_get(8).map_err(map_postgres_error)?;
-    let recorded_at_ms: i64 = row.try_get(9).map_err(map_postgres_error)?;
+    let event_id: String = row
+        .get(0)
+        .ok_or_else(|| EventStoreError::Deserialization("missing event_id column".to_owned()))?;
+    let aggregate_id: String = row.get(1).ok_or_else(|| {
+        EventStoreError::Deserialization("missing aggregate_id column".to_owned())
+    })?;
+    let aggregate_type: String = row.get(2).ok_or_else(|| {
+        EventStoreError::Deserialization("missing aggregate_type column".to_owned())
+    })?;
+    let revision: i64 = row
+        .get(3)
+        .ok_or_else(|| EventStoreError::Deserialization("missing revision column".to_owned()))?;
+    let sequence: u64 = row
+        .get(4)
+        .ok_or_else(|| EventStoreError::Deserialization("missing sequence column".to_owned()))?;
+    let event_type: String = row
+        .get(5)
+        .ok_or_else(|| EventStoreError::Deserialization("missing event_type column".to_owned()))?;
+    let event_version: i32 = row.get(6).ok_or_else(|| {
+        EventStoreError::Deserialization("missing event_version column".to_owned())
+    })?;
+    let payload_str: String = row
+        .get(7)
+        .ok_or_else(|| EventStoreError::Deserialization("missing payload column".to_owned()))?;
+    let metadata_str: String = row
+        .get(8)
+        .ok_or_else(|| EventStoreError::Deserialization("missing metadata column".to_owned()))?;
+    let recorded_at_ms: i64 = row.get(9).ok_or_else(|| {
+        EventStoreError::Deserialization("missing recorded_at_ms column".to_owned())
+    })?;
 
     let revision = u64::try_from(revision).map_err(|_| {
         EventStoreError::Deserialization("stored revision cannot be negative".to_owned())
-    })?;
-    let sequence = u64::try_from(sequence).map_err(|_| {
-        EventStoreError::Deserialization("PostgreSQL sequence cannot be negative".to_owned())
     })?;
     let event_version = u32::try_from(event_version).map_err(|_| {
         EventStoreError::Deserialization("event_version cannot be negative".to_owned())
     })?;
     let aggregate_id = deserialize_id(&aggregate_id)?;
+
+    let payload_val: serde_json::Value = serde_json::from_str(&payload_str)
+        .map_err(|error| EventStoreError::Deserialization(format!("payload JSON: {error}")))?;
 
     let payload_bytes = serde_json::to_vec(&payload_val).map_err(|error| {
         EventStoreError::Deserialization(format!(
@@ -349,7 +427,9 @@ where
         .map_err(|error| EventStoreError::Deserialization(format!("payload JSON: {error}")))?;
 
     let payload = deserialize_payload(&event_id, &event_type, payload)?;
-    let metadata = deserialize_metadata(&event_id, metadata)?;
+    let metadata_val: serde_json::Value = serde_json::from_str(&metadata_str)
+        .map_err(|error| EventStoreError::Deserialization(format!("metadata JSON: {error}")))?;
+    let metadata = deserialize_metadata(&event_id, metadata_val)?;
     let recorded_at = millis_to_system_time(recorded_at_ms)?;
 
     Ok(EventEnvelope::new(
@@ -366,59 +446,49 @@ where
     ))
 }
 
-fn map_postgres_insert_error(
-    error: ::postgres::Error,
-    expected: ExpectedRevision,
-    actual: u64,
-) -> EventStoreError {
-    if error
-        .code()
-        .is_some_and(|code| *code == ::postgres::error::SqlState::UNIQUE_VIOLATION)
-    {
-        return EventStoreError::Concurrency(crate::ConcurrencyError::WrongExpectedRevision {
-            expected,
-            actual,
-        });
-    }
-
-    map_postgres_error(error)
-}
-
-fn map_postgres_error(error: ::postgres::Error) -> EventStoreError {
+fn map_mysql_error(error: MySqlError) -> EventStoreError {
     EventStoreError::Backend(error.to_string())
 }
 
-/// Postgres checkpoint store implementation.
-#[derive(Clone)]
-pub struct PostgresCheckpointStore {
-    client: Arc<Mutex<::postgres::Client>>,
+fn map_mysql_insert_error(
+    error: MySqlError,
+    expected_revision: ExpectedRevision,
+    actual_revision: u64,
+) -> EventStoreError {
+    match &error {
+        MySqlError::MySqlError(e) if e.code == 1062 => {
+            EventStoreError::Concurrency(crate::ConcurrencyError::WrongExpectedRevision {
+                expected: expected_revision,
+                actual: actual_revision,
+            })
+        }
+        _ => map_mysql_error(error),
+    }
+}
+
+/// MySQL checkpoint store implementation.
+#[derive(Clone, Debug)]
+pub struct MySqlCheckpointStore {
+    connection: Arc<Mutex<Conn>>,
     table_name: String,
 }
 
-impl std::fmt::Debug for PostgresCheckpointStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PostgresCheckpointStore")
-            .field("table_name", &self.table_name)
-            .finish_non_exhaustive()
-    }
-}
-
-impl PostgresCheckpointStore {
-    /// Creates a Postgres checkpoint store using the default table name.
-    pub fn new(client: ::postgres::Client) -> Result<Self, EventStoreError> {
-        Self::with_table_name(client, "projection_checkpoints")
+impl MySqlCheckpointStore {
+    /// Creates a MySQL checkpoint store using the default table name.
+    pub fn new(connection: Conn) -> Result<Self, EventStoreError> {
+        Self::with_table_name(connection, "projection_checkpoints")
     }
 
-    /// Creates a Postgres checkpoint store with a custom table name.
+    /// Creates a MySQL checkpoint store with a custom table name.
     pub fn with_table_name(
-        client: ::postgres::Client,
+        connection: Conn,
         table_name: impl Into<String>,
     ) -> Result<Self, EventStoreError> {
         let table_name = table_name.into();
         validate_table_name(&table_name)?;
 
         let store = Self {
-            client: Arc::new(Mutex::new(client)),
+            connection: Arc::new(Mutex::new(connection)),
             table_name,
         };
         store.initialize_schema()?;
@@ -427,33 +497,36 @@ impl PostgresCheckpointStore {
 
     /// Initializes the checkpoint schema table.
     pub fn initialize_schema(&self) -> Result<(), EventStoreError> {
-        let config = crate::schema::SqlSchemaConfig::new(crate::schema::SqlDialect::Postgres)
+        let config = crate::schema::SqlSchemaConfig::new(crate::schema::SqlDialect::MySql)
             .with_checkpoints_table(&self.table_name);
         let migrator = crate::schema::SchemaMigrator::new(config);
-        let mut client = self.client.lock().map_err(|_| EventStoreError::Poisoned)?;
-        migrator.run_postgres(&mut client)
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| EventStoreError::Poisoned)?;
+        migrator.run_mysql(&mut connection)
     }
 }
 
-impl crate::projection::CheckpointStore for PostgresCheckpointStore {
+impl CheckpointStore for MySqlCheckpointStore {
     type Error = EventStoreError;
 
     fn load_checkpoint(&self, projection_name: &str) -> Result<Option<u64>, Self::Error> {
-        let mut client = self.client.lock().map_err(|_| EventStoreError::Poisoned)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| EventStoreError::Poisoned)?;
         let sql = format!(
-            "SELECT sequence FROM {} WHERE projection_name = $1;",
+            "SELECT sequence FROM {} WHERE projection_name = ?;",
             self.table_name
         );
-        let rows = client
-            .query(&sql, &[&projection_name])
-            .map_err(map_postgres_error)?;
+        let row_opt: Option<Row> = connection
+            .exec_first(&sql, (projection_name,))
+            .map_err(map_mysql_error)?;
 
-        if let Some(row) = rows.first() {
-            let sequence: i64 = row.get(0);
-            let sequence = u64::try_from(sequence).map_err(|_| {
-                EventStoreError::Deserialization(
-                    "Postgres checkpoint cannot be negative".to_owned(),
-                )
+        if let Some(row) = row_opt {
+            let sequence: u64 = row.get(0).ok_or_else(|| {
+                EventStoreError::Deserialization("missing sequence in checkpoint row".to_owned())
             })?;
             Ok(Some(sequence))
         } else {
@@ -462,34 +535,33 @@ impl crate::projection::CheckpointStore for PostgresCheckpointStore {
     }
 
     fn save_checkpoint(&self, projection_name: &str, sequence: u64) -> Result<(), Self::Error> {
-        let mut client = self.client.lock().map_err(|_| EventStoreError::Poisoned)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| EventStoreError::Poisoned)?;
         let sql = format!(
-            "INSERT INTO {} (projection_name, sequence) VALUES ($1, $2)
-             ON CONFLICT (projection_name) DO UPDATE SET sequence = EXCLUDED.sequence;",
+            "INSERT INTO {} (projection_name, sequence) VALUES (?, ?) \
+             ON DUPLICATE KEY UPDATE sequence = VALUES(sequence);",
             self.table_name
         );
-        let sequence_i64 = i64::try_from(sequence)
-            .map_err(|_| EventStoreError::Deserialization("checkpoint exceeds i64".to_owned()))?;
-        client
-            .execute(&sql, &[&projection_name, &sequence_i64])
-            .map_err(map_postgres_error)?;
+        connection
+            .exec_drop(&sql, (projection_name, sequence))
+            .map_err(map_mysql_error)?;
         Ok(())
     }
 }
 
 #[cfg(feature = "async")]
 #[async_trait::async_trait]
-impl crate::projection::AsyncCheckpointStore for PostgresCheckpointStore {
+impl crate::projection::AsyncCheckpointStore for MySqlCheckpointStore {
     type Error = EventStoreError;
 
     async fn load_checkpoint(&self, projection_name: &str) -> Result<Option<u64>, Self::Error> {
         let this = self.clone();
         let name = projection_name.to_owned();
-        tokio::task::spawn_blocking(move || {
-            crate::projection::CheckpointStore::load_checkpoint(&this, &name)
-        })
-        .await
-        .map_err(|e| EventStoreError::Backend(e.to_string()))?
+        tokio::task::spawn_blocking(move || CheckpointStore::load_checkpoint(&this, &name))
+            .await
+            .map_err(|e| EventStoreError::Backend(e.to_string()))?
     }
 
     async fn save_checkpoint(
@@ -500,69 +572,66 @@ impl crate::projection::AsyncCheckpointStore for PostgresCheckpointStore {
         let this = self.clone();
         let name = projection_name.to_owned();
         tokio::task::spawn_blocking(move || {
-            crate::projection::CheckpointStore::save_checkpoint(&this, &name, sequence)
+            CheckpointStore::save_checkpoint(&this, &name, sequence)
         })
         .await
         .map_err(|e| EventStoreError::Backend(e.to_string()))?
     }
 }
 
-/// PostgreSQL-backed idempotency store.
-///
-/// The store persists pending reservations and completed JSON-serializable
-/// values so command retries can be deduplicated across process restarts.
-pub struct PostgresIdempotencyStore<V>
+/// MySQL-backed idempotency store.
+pub struct MySqlIdempotencyStore<V>
 where
     V: Clone,
 {
-    client: Arc<Mutex<Client>>,
+    connection: Arc<Mutex<Conn>>,
     table_name: String,
     _marker: PhantomData<fn() -> V>,
 }
 
-impl<V> Clone for PostgresIdempotencyStore<V>
+impl<V> Clone for MySqlIdempotencyStore<V>
 where
     V: Clone,
 {
     fn clone(&self) -> Self {
         Self {
-            client: Arc::clone(&self.client),
+            connection: Arc::clone(&self.connection),
             table_name: self.table_name.clone(),
             _marker: PhantomData,
         }
     }
 }
 
-impl<V> std::fmt::Debug for PostgresIdempotencyStore<V>
+impl<V> std::fmt::Debug for MySqlIdempotencyStore<V>
 where
     V: Clone,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PostgresIdempotencyStore")
+        f.debug_struct("MySqlIdempotencyStore")
             .field("table_name", &self.table_name)
             .finish_non_exhaustive()
     }
 }
 
-impl<V> PostgresIdempotencyStore<V>
+impl<V> MySqlIdempotencyStore<V>
 where
     V: Clone,
 {
-    /// Creates a PostgreSQL idempotency store using the default table name.
-    pub fn new(client: Client) -> Result<Self, EventStoreError> {
-        Self::with_table_name(client, "idempotency_keys")
+    /// Creates a MySQL idempotency store using the default table name.
+    pub fn new(connection: Conn) -> Result<Self, EventStoreError> {
+        Self::with_table_name(connection, "idempotency_keys")
     }
 
-    /// Creates a PostgreSQL idempotency store with a custom table name.
+    /// Creates a MySQL idempotency store with a custom table name.
     pub fn with_table_name(
-        client: Client,
+        connection: Conn,
         table_name: impl Into<String>,
     ) -> Result<Self, EventStoreError> {
         let table_name = table_name.into();
         validate_table_name(&table_name)?;
 
         let store = Self {
-            client: Arc::new(Mutex::new(client)),
+            connection: Arc::new(Mutex::new(connection)),
             table_name,
             _marker: PhantomData,
         };
@@ -572,41 +641,49 @@ where
 
     /// Initializes the idempotency schema table.
     pub fn initialize_schema(&self) -> Result<(), EventStoreError> {
-        let config = crate::schema::SqlSchemaConfig::new(crate::schema::SqlDialect::Postgres)
+        let config = crate::schema::SqlSchemaConfig::new(crate::schema::SqlDialect::MySql)
             .with_idempotency_table(&self.table_name);
         let migrator = crate::schema::SchemaMigrator::new(config);
-        let mut client = self.client.lock().map_err(|_| EventStoreError::Poisoned)?;
-        migrator.run_postgres(&mut client)
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| EventStoreError::Poisoned)?;
+        migrator.run_mysql(&mut connection)
     }
 }
 
-impl<V> IdempotencyStore<V> for PostgresIdempotencyStore<V>
+impl<V> IdempotencyStore<V> for MySqlIdempotencyStore<V>
 where
     V: Clone + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
 {
     type Error = EventStoreError;
 
     fn load(&self, key: &IdempotencyKey) -> Result<Option<IdempotencyState<V>>, Self::Error> {
-        let mut client = self.client.lock().map_err(|_| EventStoreError::Poisoned)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| EventStoreError::Poisoned)?;
         let sql = format!(
-            "SELECT state, value FROM {} WHERE idempotency_key = $1;",
+            "SELECT state, value FROM {} WHERE idempotency_key = ?;",
             self.table_name
         );
-        let row = client
-            .query_opt(&sql, &[&key.as_str()])
-            .map_err(map_postgres_error)?;
+        let row_opt: Option<Row> = connection
+            .exec_first(&sql, (key.as_str(),))
+            .map_err(map_mysql_error)?;
 
-        let Some(row) = row else {
+        let Some(row) = row_opt else {
             return Ok(None);
         };
 
-        let state: String = row.try_get(0).map_err(map_postgres_error)?;
-        let value: Option<serde_json::Value> = row.try_get(1).map_err(map_postgres_error)?;
+        let state: String = row
+            .get(0)
+            .ok_or_else(|| EventStoreError::Deserialization("missing state column".to_owned()))?;
+        let value_str: Option<String> = row.get::<Option<String>, _>(1).flatten();
 
-        match (state.as_str(), value) {
+        match (state.as_str(), value_str) {
             ("pending", _) => Ok(Some(IdempotencyState::Pending)),
-            ("complete", Some(value)) => {
-                let value = serde_json::from_value(value).map_err(|error| {
+            ("complete", Some(value_str)) => {
+                let value = serde_json::from_str(&value_str).map_err(|error| {
                     EventStoreError::Deserialization(format!("idempotency value JSON: {error}"))
                 })?;
                 Ok(Some(IdempotencyState::Complete(value)))
@@ -621,57 +698,66 @@ where
     }
 
     fn reserve(&self, key: IdempotencyKey) -> Result<bool, Self::Error> {
-        let mut client = self.client.lock().map_err(|_| EventStoreError::Poisoned)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| EventStoreError::Poisoned)?;
         let updated_at_ms = system_time_to_millis(SystemTime::now())?;
+
+        // MySQL INSERT IGNORE behaves like INSERT OR IGNORE / ON CONFLICT DO NOTHING
         let sql = format!(
-            "INSERT INTO {} (idempotency_key, state, value, updated_at_ms)
-             VALUES ($1, 'pending', NULL, $2)
-             ON CONFLICT (idempotency_key) DO NOTHING;",
+            "INSERT IGNORE INTO {} (idempotency_key, state, value, updated_at_ms) \
+             VALUES (?, 'pending', NULL, ?);",
             self.table_name
         );
-        let changed = client
-            .execute(&sql, &[&key.as_str(), &updated_at_ms])
-            .map_err(map_postgres_error)?;
-        Ok(changed == 1)
+        connection
+            .exec_drop(&sql, (key.as_str(), updated_at_ms))
+            .map_err(map_mysql_error)?;
+
+        let affected = connection.affected_rows();
+        Ok(affected == 1)
     }
 
     fn save(&self, key: IdempotencyKey, value: V) -> Result<(), Self::Error> {
-        let mut client = self.client.lock().map_err(|_| EventStoreError::Poisoned)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| EventStoreError::Poisoned)?;
         let updated_at_ms = system_time_to_millis(SystemTime::now())?;
-        let value_json = serde_json::to_value(value).map_err(|error| {
+        let value_json = serde_json::to_string(&value).map_err(|error| {
             EventStoreError::Serialization(format!("idempotency value JSON: {error}"))
         })?;
         let sql = format!(
-            "INSERT INTO {} (idempotency_key, state, value, updated_at_ms)
-             VALUES ($1, 'complete', $2::jsonb, $3)
-             ON CONFLICT (idempotency_key) DO UPDATE SET
-                state = EXCLUDED.state,
-                value = EXCLUDED.value,
-                updated_at_ms = EXCLUDED.updated_at_ms;",
+            "INSERT INTO {} (idempotency_key, state, value, updated_at_ms) \
+             VALUES (?, 'complete', ?, ?) \
+             ON DUPLICATE KEY UPDATE \
+                state = VALUES(state), \
+                value = VALUES(value), \
+                updated_at_ms = VALUES(updated_at_ms);",
             self.table_name
         );
-        client
-            .execute(&sql, &[&key.as_str(), &value_json, &updated_at_ms])
-            .map_err(map_postgres_error)?;
+        connection
+            .exec_drop(&sql, (key.as_str(), value_json, updated_at_ms))
+            .map_err(map_mysql_error)?;
         Ok(())
     }
 
     fn remove(&self, key: &IdempotencyKey) -> Result<(), Self::Error> {
-        let mut client = self.client.lock().map_err(|_| EventStoreError::Poisoned)?;
-        let sql = format!(
-            "DELETE FROM {} WHERE idempotency_key = $1;",
-            self.table_name
-        );
-        client
-            .execute(&sql, &[&key.as_str()])
-            .map_err(map_postgres_error)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| EventStoreError::Poisoned)?;
+        let sql = format!("DELETE FROM {} WHERE idempotency_key = ?;", self.table_name);
+        connection
+            .exec_drop(&sql, (key.as_str(),))
+            .map_err(map_mysql_error)?;
         Ok(())
     }
 }
 
 #[cfg(feature = "async")]
 #[async_trait::async_trait]
-impl<V> crate::async_api::AsyncIdempotencyStore<V> for PostgresIdempotencyStore<V>
+impl<V> crate::async_api::AsyncIdempotencyStore<V> for MySqlIdempotencyStore<V>
 where
     V: Clone + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
 {

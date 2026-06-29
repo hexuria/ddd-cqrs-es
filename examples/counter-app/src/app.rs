@@ -99,22 +99,18 @@ fn HomePage() -> impl IntoView {
         if optimistic_count.get().is_none() {
             #[cfg(feature = "hydrate")]
             {
-                if let Some(window) = window() {
-                    if let Ok(Some(storage)) = window.local_storage() {
-                        if let Ok(Some(cached_count_str)) = storage.get_item("counter_app_count") {
-                            if let Ok(cached_count) = cached_count_str.parse::<i32>() {
+                if let Some(window) = window()
+                    && let Ok(Some(storage)) = window.local_storage() {
+                        if let Ok(Some(cached_count_str)) = storage.get_item("counter_app_count")
+                            && let Ok(cached_count) = cached_count_str.parse::<i32>() {
                                 set_optimistic_count.set(Some(cached_count));
                             }
-                        }
                         if let Ok(Some(cached_sequence_str)) =
                             storage.get_item("counter_app_last_sequence")
-                        {
-                            if let Ok(cached_sequence) = cached_sequence_str.parse::<u64>() {
+                            && let Ok(cached_sequence) = cached_sequence_str.parse::<u64>() {
                                 set_last_seen_sequence.set(cached_sequence);
                             }
-                        }
                     }
-                }
             }
         }
     });
@@ -127,13 +123,12 @@ fn HomePage() -> impl IntoView {
 
             #[cfg(feature = "hydrate")]
             {
-                if let Some(window) = window() {
-                    if let Ok(Some(storage)) = window.local_storage() {
+                if let Some(window) = window()
+                    && let Ok(Some(storage)) = window.local_storage() {
                         let _ = storage.set_item("counter_app_count", &view_data.count.to_string());
                         let _ = storage
                             .set_item("counter_app_last_sequence", &view_data.last_sequence.to_string());
                     }
-                }
             }
         }
     });
@@ -145,14 +140,13 @@ fn HomePage() -> impl IntoView {
             decrement_action.value().get(),
             reset_action.value().get(),
         ] {
-            if let Some(Ok(view_data)) = candidate {
-                if next_view
+            if let Some(Ok(view_data)) = candidate
+                && next_view
                     .as_ref()
                     .is_none_or(|current| view_data.last_sequence >= current.last_sequence)
                 {
                     next_view = Some(view_data);
                 }
-            }
         }
 
         if let Some(view_data) = next_view {
@@ -162,13 +156,12 @@ fn HomePage() -> impl IntoView {
 
             #[cfg(feature = "hydrate")]
             {
-                if let Some(window) = window() {
-                    if let Ok(Some(storage)) = window.local_storage() {
+                if let Some(window) = window()
+                    && let Ok(Some(storage)) = window.local_storage() {
                         let _ = storage.set_item("counter_app_count", &view_data.count.to_string());
                         let _ = storage
                             .set_item("counter_app_last_sequence", &view_data.last_sequence.to_string());
                     }
-                }
             }
         }
     });
@@ -196,13 +189,12 @@ fn HomePage() -> impl IntoView {
             set_last_seen_sequence.set(message.last_sequence);
             set_current_view.set(Some(message.view.clone()));
 
-            if let Some(window) = window() {
-                if let Ok(Some(storage)) = window.local_storage() {
+            if let Some(window) = window()
+                && let Ok(Some(storage)) = window.local_storage() {
                     let _ = storage.set_item("counter_app_count", &message.view.count.to_string());
                     let _ = storage
                         .set_item("counter_app_last_sequence", &message.last_sequence.to_string());
                 }
-            }
         });
         let callback = onmessage.as_ref().unchecked_ref();
         source.set_onmessage(Some(callback));
@@ -292,7 +284,7 @@ fn HomePage() -> impl IntoView {
                             </div>
                         </div>
                         <p class="text-slate-400 text-xs">
-                            "Built with Leptos Server Functions, WASIp2, and Spin Host SQLite."
+                            "Built with Leptos Server Functions, WASIp2, and pluggable persistence."
                         </p>
                     </div>
 
@@ -522,7 +514,7 @@ fn NotFound() -> impl IntoView {
 pub async fn get_counter_view_db() -> Result<CounterViewDto, ServerFnError> {
     crate::store::get_counter_view_db()
         .await
-        .map_err(|e| ServerFnError::new(e))
+        .map_err(ServerFnError::new)
 }
 
 #[cfg(feature = "ssr")]
@@ -580,7 +572,7 @@ async fn run_cqrs_command(command: crate::domain::CounterCommand) -> Result<Coun
             .map_err(|e| ServerFnError::new(e.to_string()))?;
     } else {
         crate::store::run_projections_async(&event_store, &checkpoint_store, &mut projection).await
-            .map_err(|e| ServerFnError::new(e))?;
+            .map_err(ServerFnError::new)?;
     }
 
     let view = get_counter_view_db().await?;

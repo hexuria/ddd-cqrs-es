@@ -22,6 +22,9 @@ ddd_cqrs_es = { git = "https://github.com/hexuria/ddd-cqrs-es" }
 To enable durable database adapters:
 * **SQLite Support:** Enable the `"sqlite"` feature.
 * **PostgreSQL Support:** Enable the `"postgres"` feature.
+* **MySQL Support:** Enable the `"mysql"` feature.
+* **WASI MySQL Helper:** Enable `"wasi-mysql"` for raw TCP MySQL query execution from generic Wasmtime/WASI runtimes.
+* **Spin MySQL Helper:** Enable `"spin-mysql"` for Spin SDK MySQL query execution.
 * **LibSQL Support:** Enable the `"wasi-libsql"` feature (for Turso or generic LibSQL).
 * **Redis Support:** Enable the `"redis"` feature plus `"wasi-redis"` or `"spin-redis"` for experimental async Redis persistence and notification helpers.
 
@@ -30,14 +33,14 @@ To enable durable database adapters:
 * **PostgreSQL:** Fully supported via stable high-performance relational database using the `"postgres"` feature.
 * **LibSQL / Turso:** Supported via distributed SQL edge helpers using the `"wasi-libsql"` feature.
 * **Redis:** Supported via async event store, checkpoints, and pub/sub notifications using the `"redis"` feature.
-* ⚠️ **MySQL:** **Not supported.** We do not provide MySQL adapters or query helpers.
+* **MySQL:** Supported on native targets via stable event/checkpoint/idempotency stores using the `"mysql"` feature. WASI examples can also use lower-level MySQL query helpers through `"wasi-mysql"` on Wasmtime or `"spin-mysql"` on Spin.
 
 #### ⚡ Realtime Updates Support:
 Real-time state and streaming updates are fully supported out-of-the-box when using:
 1. **PostgreSQL & SQLite:** Supported via native asynchronous HTTP Response Streaming / Server-Sent Events (SSE) polling streams with non-blocking WASIp3 timers.
 2. **Redis:** Supported natively via Redis Pub/Sub wake-up notifications and SSE connections.
 
-The stable built-in SQL adapters are `SqliteEventStore`, `PostgresEventStore`, `SqliteCheckpointStore`, `PostgresCheckpointStore`, `SqliteIdempotencyStore`, and `PostgresIdempotencyStore`. WASI, Spin, Neon, LibSQL, and Supabase feature flags expose lower-level query helpers for examples and runtime experiments. Redis exposes an experimental async `RedisEventStore`, `RedisCheckpointStore`, and `RedisPubSubPublisher`; pub/sub is notification-only and durable event replay remains the source of truth. The counter example includes a separate Spin Redis Trigger sidecar for subscriber smoke testing; it is not part of the root library API.
+The stable built-in SQL adapters are `SqliteEventStore`, `PostgresEventStore`, `MySqlEventStore` (native only), `SqliteCheckpointStore`, `PostgresCheckpointStore`, `MySqlCheckpointStore` (native only), `SqliteIdempotencyStore`, `PostgresIdempotencyStore`, and `MySqlIdempotencyStore` (native only). WASI, Spin, Neon, LibSQL, Supabase, and MySQL runtime feature flags expose lower-level query helpers for examples and runtime experiments. Redis exposes an experimental async `RedisEventStore`, `RedisCheckpointStore`, and `RedisPubSubPublisher`; pub/sub is notification-only and durable event replay remains the source of truth. The counter example includes a separate Spin Redis Trigger sidecar for subscriber smoke testing; it is not part of the root library API. The WASI counter-app supports `db=mysql` on Wasmtime through raw TCP (`wasi-mysql`) and on Spin through `spin_sdk::mysql` (`spin-mysql`).
 
 ---
 

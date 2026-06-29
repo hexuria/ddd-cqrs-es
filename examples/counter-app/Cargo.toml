@@ -35,7 +35,7 @@ md5 = "0.7"
 async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.18", features = ["fmt", "env-filter"], optional = true }
-ddd_cqrs_es = { path = "../../", default-features = false, features = ["json", "serde", "async", "tracing"] }
+ddd_cqrs_es = { path = "../../", default-features = false, features = ["json", "serde", "async", "tracing", "json-file"] }
 rustls = { version = "0.23.12", default-features = false, features = ["std", "tls12"], optional = true }
 rustls-rustcrypto = { version = "0.0.2-alpha", optional = true }
 webpki-roots = { version = "0.26.3", optional = true }
@@ -95,6 +95,19 @@ supabase = [
 redis = [
   "ssr",
   "ddd_cqrs_es/redis",
+]
+mysql = [
+  "ssr",
+]
+spin-mysql = [
+  "mysql",
+  "dep:spin-sdk",
+  "spin-sdk/mysql",
+  "ddd_cqrs_es/spin-mysql",
+]
+wasi-mysql = [
+  "mysql",
+  "ddd_cqrs_es/wasi-mysql",
 ]
 spin-redis = [
   "redis",

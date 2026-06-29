@@ -95,17 +95,20 @@ Our framework supports multiple database options depending on your environment.
 | **PostgreSQL** | `"postgres"` | Native Sync (event, checkpoint, idempotency) | Yes (via SSE polling/polling stream) | Yes |
 | **LibSQL / Turso** | `"wasi-libsql"` | Async HTTP / Hrana SQL query helpers | No | Experimental / WASM |
 | **Redis** | `"redis"` | Async (event, checkpoint, pub/sub) | Yes (via Pub/Sub / SSE notifications) | Experimental / WASM |
-| **MySQL** | *None* | **Not Supported** | No | No |
+| **MySQL** | `"mysql"`, `"wasi-mysql"`, `"spin-mysql"` | Native Sync stores plus raw TCP Wasmtime and Spin SDK query helpers | Application-owned polling or external pub/sub bridge | Yes for native stores; runtime helpers are experimental / WASM |
 
 #### To Enable Durable Database Adapters:
 * **SQLite Support:** Enable the `"sqlite"` feature.
 * **PostgreSQL Support:** Enable the `"postgres"` feature.
+* **MySQL Support:** Enable the `"mysql"` feature.
+* **WASI MySQL Helper:** Enable `"wasi-mysql"` for raw TCP MySQL query execution from generic Wasmtime/WASI runtimes.
+* **Spin MySQL Helper:** Enable `"spin-mysql"` for Spin SDK MySQL query execution.
 * **LibSQL Support:** Enable the `"wasi-libsql"` feature.
 * **Redis Support:** Enable the `"redis"` feature with `"wasi-redis"` or `"spin-redis"`.
 
 > [!NOTE]
-> **MySQL is not supported** by our framework. We support SQLite, PostgreSQL, LibSQL, and Redis backends.
-> Real-time updates are supported out-of-the-box with **PostgreSQL** and **Redis** (as well as SQLite). Postgres/SQLite utilize native asynchronous HTTP response streaming (SSE) polling streams with non-blocking clocks, while Redis utilizes Pub/Sub and SSE notifications.
+> We support SQLite, PostgreSQL, MySQL, LibSQL, and Redis backends.
+> Real-time updates are supported out-of-the-box with **PostgreSQL** and **Redis** (as well as SQLite). Postgres/SQLite utilize native asynchronous HTTP response streaming (SSE) polling streams with non-blocking clocks, while Redis utilizes Pub/Sub and SSE notifications. MySQL remains a durable data store and does not provide database-native pub/sub in this library; pair it with application polling, an outbox worker, binlog CDC, Redis, NATS, Kafka, or WebSocket fan-out when push-style notifications are required.
 
 ### 1. SQLite Store (Embedded File)
 Perfect for edge applications, local databases, or desktop apps. Enable with the `"sqlite"` feature.

@@ -23,14 +23,18 @@ chrono = ["dep:chrono"]
 tracing = ["dep:tracing"]
 postgres = ["json", "dep:postgres"]
 sqlite = ["json", "dep:rusqlite"]
+mysql = ["json", "dep:mysql"]
+json-file = ["json", "async"]
 redis = ["json", "async"]
 wasm = ["uuid/js"]
 wasi-http = ["dep:wasip3", "dep:http", "dep:http-body-util", "dep:bytes", "json"]
 wasi-neon = ["wasi-http"]
 wasi-libsql = ["wasi-http"]
 wasi-postgres-tcp = ["json", "dep:md5", "dep:base64", "dep:pbkdf2", "dep:hmac", "dep:sha2", "dep:rustls", "dep:rustls-rustcrypto", "dep:webpki-roots"]
+wasi-mysql = ["json", "dep:getrandom", "dep:rsa", "dep:sha1", "dep:sha2"]
 spin-sqlite = ["dep:spin-sdk", "json"]
 spin-postgres = ["dep:spin-sdk", "json"]
+spin-mysql = ["dep:spin-sdk", "spin-sdk/mysql", "json"]
 spin-redis = ["redis", "dep:spin-sdk", "spin-sdk/redis"]
 wasi-redis = ["redis"]
 wasi-supabase-rpc = ["wasi-http"]
@@ -41,9 +45,10 @@ async-trait = { version = "0.1", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"], optional = true }
 postgres = { version = "0.19", features = ["with-serde_json-1"], optional = true }
 rusqlite = { version = "0.32", optional = true }
+mysql = { version = "25", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
-tokio = { version = "1", features = ["time"], optional = true }
+tokio = { version = "1", features = ["time", "sync", "rt"], optional = true }
 tracing = { version = "0.1", optional = true }
 uuid = { version = "1", features = ["serde", "v4"], optional = true }
 wasip3 = { version = "0.6.0", features = ["http-compat"], optional = true }
@@ -55,6 +60,9 @@ md5 = { version = "0.7", optional = true }
 base64 = { version = "0.22.1", optional = true }
 pbkdf2 = { version = "0.12.2", optional = true }
 hmac = { version = "0.12.1", optional = true }
+getrandom = { version = "0.4.3", features = ["std"], optional = true }
+rsa = { version = "0.9.10", optional = true }
+sha1 = { version = "0.10.6", optional = true }
 sha2 = { version = "0.10.8", optional = true }
 rustls = { version = "0.23.12", default-features = false, features = ["std", "tls12"], optional = true }
 rustls-rustcrypto = { version = "0.0.2-alpha", optional = true }

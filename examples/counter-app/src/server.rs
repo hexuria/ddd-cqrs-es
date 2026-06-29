@@ -23,12 +23,11 @@ impl wasip3::exports::http::handler::Guest for LeptosServer {
 
         // Store-level initialization is guarded by an async lock, so concurrent
         // first requests do not run migrations more than once.
-        if !request_path.starts_with("/pkg/") {
-            if let Err(e) = crate::store::initialize_schema_async().await {
+        if !request_path.starts_with("/pkg/")
+            && let Err(e) = crate::store::initialize_schema_async().await {
                 eprintln!("Error executing boot schema migrations: {:?}", e);
                 return Err(ErrorCode::InternalError(None));
             }
-        }
 
         if request_path == "/api/counter/stream" {
             let response = crate::store::counter_stream_response(&req)

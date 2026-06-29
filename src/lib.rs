@@ -99,6 +99,8 @@ pub mod event_store;
 pub mod idempotency;
 pub mod memory;
 pub mod metadata;
+#[cfg(feature = "mysql")]
+pub mod mysql;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod process_manager;
@@ -106,8 +108,8 @@ pub mod projection;
 #[cfg(feature = "redis")]
 pub mod redis;
 pub mod repository;
+pub mod schema;
 pub mod snapshot;
-#[cfg(any(feature = "postgres", feature = "sqlite", feature = "redis"))]
 mod sql_common;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
@@ -122,6 +124,8 @@ pub use async_api::{
     AsyncQueryHandler, AsyncRepository, AsyncRepositoryResult, AsyncSnapshotStore,
 };
 
+#[cfg(feature = "json-file")]
+pub use adapters::{JsonFileCheckpointStore, JsonFileEventStore};
 pub use command::{CommandBus, CommandHandler, QueryHandler};
 pub use error::{ConcurrencyError, EventStoreError, EventStoreFailure, RepositoryError};
 pub use event::{
@@ -135,14 +139,19 @@ pub use idempotency::{
 };
 pub use memory::InMemoryEventStore;
 pub use metadata::Metadata;
+#[cfg(feature = "mysql")]
+pub use mysql::{MySqlCheckpointStore, MySqlEventStore, MySqlIdempotencyStore};
 #[cfg(feature = "postgres")]
 pub use postgres::{PostgresCheckpointStore, PostgresEventStore, PostgresIdempotencyStore};
 pub use process_manager::ProcessManager;
 #[cfg(feature = "async")]
-pub use projection::{AsyncCheckpointStore, AsyncPersistedProjectionRunner};
 pub use projection::{
-    CheckpointStore, InMemoryProjectionRunner, PersistedProjectionRunner, Projection,
-    ProjectionRunnerError,
+    AsyncCheckpointStore, AsyncCheckpointedProjection, AsyncCheckpointedProjectionRunner,
+    AsyncPersistedProjectionRunner,
+};
+pub use projection::{
+    CheckpointStore, CheckpointedProjection, CheckpointedProjectionRunner,
+    InMemoryProjectionRunner, PersistedProjectionRunner, Projection, ProjectionRunnerError,
 };
 #[cfg(feature = "spin-redis")]
 pub use redis::SpinRedisClient;
@@ -156,6 +165,9 @@ pub use repository::{
     CommittedEvents, ExecutionOutcome, IdempotentRepositoryResult, Repository, RepositoryResult,
     SnapshotRepositoryResult,
 };
+#[cfg(feature = "async")]
+pub use schema::AsyncSchemaInitializer;
+pub use schema::{SchemaMigration, SchemaMigrator, SqlDialect, SqlSchemaConfig};
 pub use snapshot::{
     InMemorySnapshotError, InMemorySnapshotStore, Snapshot, SnapshotRepositoryError, SnapshotStore,
 };

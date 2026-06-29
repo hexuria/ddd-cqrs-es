@@ -29,24 +29,32 @@ Our framework is highly modular. You can enable specific adapters and engines de
 #### Enabling Durable Database Adapters:
 * **SQLite Support:** Enable the `"sqlite"` feature (uses the `rusqlite` driver under the hood).
 * **PostgreSQL Support:** Enable the `"postgres"` feature (uses the `postgres` driver under the hood).
+* **MySQL Support:** Enable the `"mysql"` feature (uses the `mysql` driver under the hood).
+* **WASI MySQL Helper:** Enable `"wasi-mysql"` for raw TCP MySQL query execution from generic Wasmtime/WASI runtimes.
+* **Spin MySQL Helper:** Enable `"spin-mysql"` for Spin SDK MySQL query execution.
 
 #### Supported Backends:
 * **SQLite / Local File:** Standard local embedded SQL.
 * **PostgreSQL:** Stable high-performance relational database.
+* **MySQL:** High-performance relational database with native stores plus runtime query helpers for Wasmtime (`"wasi-mysql"`) and Spin (`"spin-mysql"`).
 * **LibSQL / Turso:** Supported for distributed edge SQL via the `"wasi-libsql"` query helper.
 * **Redis:** Supported for async event store, checkpoints, and pub/sub notifications via `"redis"` / `"wasi-redis"` / `"spin-redis"`.
-* ⚠️ **MySQL:** **Not supported.** We do not provide MySQL adapters or query helpers.
 
 #### Realtime Updates Support:
 Real-time streaming and state updates are supported out-of-the-box when using:
-1. **PostgreSQL / SQLite:** Supported via native asynchronous HTTP Response Streaming / Server-Sent Events (SSE) polling streams using WASIp3 non-blocking timers.
+1. **PostgreSQL / SQLite:** Supported via native asynchronous HTTP Response Streaming / Server-Sent Events (SSE) polling streams using non-blocking timers.
 2. **Redis:** Supported natively via Redis Pub/Sub wake-up notifications and SSE connections.
+
+**MySQL:** The native MySQL adapter can be used as the durable event/checkpoint/idempotency store for application-owned polling streams. MySQL does not provide a built-in pub/sub stream in this library; use Redis, an outbox worker, binlog CDC, NATS, Kafka, or WebSocket fan-out when low-latency push notifications are required.
 
 | Feature | Description | Third-Party Dependencies |
 | :--- | :--- | :--- |
 | **`default`** | Standard local, thread-safe in-memory event store and memory projection runners. | None |
 | **`sqlite`** | Stable SQLite event store, checkpoint store, and idempotency store. | `rusqlite` |
 | **`postgres`** | Stable PostgreSQL event store, checkpoint store, and idempotency store. | `postgres` |
+| **`mysql`** | Stable MySQL event store, checkpoint store, and idempotency store. | `mysql` |
+| **`wasi-mysql`** | Experimental raw TCP MySQL query helper for generic Wasmtime/WASI runtimes. | `rsa`, `sha1`, `sha2`, `getrandom` |
+| **`spin-mysql`** | Experimental Spin SDK MySQL query helper. | `spin-sdk` |
 | **`redis`** | Experimental async Redis event store, checkpoint store, pub/sub publisher, and command executor trait. | None |
 | **`wasi-redis`** | Experimental raw RESP Redis client for generic Wasmtime/WASI runtimes. | `redis` |
 | **`spin-redis`** | Experimental Spin SDK Redis client. | `spin-sdk` |

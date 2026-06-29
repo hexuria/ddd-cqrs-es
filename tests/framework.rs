@@ -32,14 +32,14 @@ enum CounterCommand {
     Increment { by: u64 },
 }
 
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct StoredIdempotencyResult {
     value: u64,
     label: String,
 }
 
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
 fn assert_sql_idempotency_store_contract<S>(store: S)
 where
     S: IdempotencyStore<StoredIdempotencyResult, Error = EventStoreError>
@@ -1105,4 +1105,300 @@ fn test_postgres_checkpoint_store() {
 
     let mut client = postgres::Client::connect(&database_url, postgres::NoTls).unwrap();
     let _ = client.execute(&format!("DROP TABLE IF EXISTS {};", table_name), &[]);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn test_sqlite_sequential_custom_table_initialization() {
+    let connection = rusqlite::Connection::open("file::memory:?cache=shared").unwrap();
+
+    // 1. Create event store with "custom_events_a" table name.
+    let event_store = ddd_cqrs_es::sqlite::SqliteEventStore::<Counter>::with_table_name(
+        connection,
+        "custom_events_a".to_owned(),
+    )
+    .unwrap();
+    event_store.initialize_schema().unwrap();
+
+    // 2. Open another connection to the shared in-memory DB and create a checkpoint store with "custom_checkpoints_a".
+    let connection2 = rusqlite::Connection::open("file::memory:?cache=shared").unwrap();
+    let checkpoint_store = ddd_cqrs_es::sqlite::SqliteCheckpointStore::with_table_name(
+        connection2,
+        "custom_checkpoints_a",
+    )
+    .unwrap();
+
+    // 3. Let's write to both of them to verify they work together and both tables exist!
+    let id = "counter-123".to_owned();
+    let events = vec![ddd_cqrs_es::NewEvent::new(
+        CounterEvent::Created,
+        Metadata::default(),
+    )];
+    event_store
+        .append(&id, ddd_cqrs_es::ExpectedRevision::Any, events)
+        .unwrap();
+
+    use ddd_cqrs_es::projection::CheckpointStore;
+    checkpoint_store
+        .save_checkpoint("projection-a", 99)
+        .unwrap();
+
+    assert_eq!(event_store.load(&id).unwrap().len(), 1);
+    assert_eq!(
+        checkpoint_store.load_checkpoint("projection-a").unwrap(),
+        Some(99)
+    );
+}
+
+#[cfg(feature = "json-file")]
+#[test]
+fn test_json_file_concurrency_and_atomicity() {
+    let dir = std::env::temp_dir();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let events_path = dir.join(format!("test_events_{}.json", nanos));
+    let checkpoints_path = dir.join(format!("test_checkpoints_{}.json", nanos));
+
+    let event_store = ddd_cqrs_es::JsonFileEventStore::<Counter>::new(events_path.clone());
+    let checkpoint_store = ddd_cqrs_es::JsonFileCheckpointStore::new(checkpoints_path.clone());
+
+    // Run parallel threads appending events concurrently
+    let store_arc = std::sync::Arc::new(event_store);
+    let mut handles = Vec::new();
+
+    for i in 0..10 {
+        let store = std::sync::Arc::clone(&store_arc);
+        let agg_id = format!("thread-{}", i);
+        let handle = thread::spawn(move || {
+            let events = vec![ddd_cqrs_es::NewEvent::new(
+                CounterEvent::Created,
+                Metadata::default(),
+            )];
+            store
+                .append(&agg_id, ddd_cqrs_es::ExpectedRevision::Any, events)
+                .unwrap();
+        });
+        handles.push(handle);
+    }
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // Verify all 10 aggregates got created and saved without corruption!
+    for i in 0..10 {
+        let agg_id = format!("thread-{}", i);
+        let stream = store_arc.load(&agg_id).unwrap();
+        assert_eq!(stream.len(), 1);
+    }
+
+    // Verify checkpoints concurrent writes
+    let cp_store = std::sync::Arc::new(checkpoint_store);
+    let mut cp_handles = Vec::new();
+    for i in 0..10 {
+        let store = std::sync::Arc::clone(&cp_store);
+        let proj_name = format!("proj-{}", i);
+        let handle = thread::spawn(move || {
+            use ddd_cqrs_es::projection::CheckpointStore;
+            store.save_checkpoint(&proj_name, i as u64).unwrap();
+        });
+        cp_handles.push(handle);
+    }
+
+    for h in cp_handles {
+        h.join().unwrap();
+    }
+
+    for i in 0..10 {
+        let proj_name = format!("proj-{}", i);
+        use ddd_cqrs_es::projection::CheckpointStore;
+        assert_eq!(
+            cp_store.load_checkpoint(&proj_name).unwrap(),
+            Some(i as u64)
+        );
+    }
+
+    // Cleanup
+    let _ = std::fs::remove_file(events_path);
+    let _ = std::fs::remove_file(checkpoints_path);
+}
+
+#[cfg(feature = "mysql")]
+static MYSQL_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(feature = "mysql")]
+fn get_admin_db_url(base_url: &str) -> String {
+    let (before_query, query) = match base_url.find('?') {
+        Some(idx) => (&base_url[..idx], &base_url[idx..]),
+        None => (base_url, ""),
+    };
+
+    if let Some(slash_idx) = before_query.rfind('/') {
+        if slash_idx > 6 {
+            let prefix = &before_query[..slash_idx];
+            return format!("{}{}", prefix, query);
+        }
+    }
+    base_url.to_string()
+}
+
+#[cfg(feature = "mysql")]
+fn get_test_db_url(base_url: &str, new_db_name: &str) -> String {
+    let (before_query, query) = match base_url.find('?') {
+        Some(idx) => (&base_url[..idx], &base_url[idx..]),
+        None => (base_url, ""),
+    };
+
+    if let Some(slash_idx) = before_query.rfind('/') {
+        if slash_idx > 6 {
+            let prefix = &before_query[..slash_idx];
+            return format!("{}/{}{}", prefix, new_db_name, query);
+        }
+    }
+    format!("{}/{}", base_url, new_db_name)
+}
+
+#[cfg(feature = "mysql")]
+struct DisposableMySqlDb {
+    admin_url: String,
+    db_name: String,
+    test_url: String,
+}
+
+#[cfg(feature = "mysql")]
+impl DisposableMySqlDb {
+    fn new() -> Result<Option<Self>, String> {
+        let base_url = match std::env::var("DDD_CQRS_ES_MYSQL_URL") {
+            Ok(value) if value.trim().is_empty() => return Ok(None),
+            Ok(value) => value.trim().to_owned(),
+            Err(std::env::VarError::NotPresent) => return Ok(None),
+            Err(error) => {
+                return Err(format!(
+                    "DDD_CQRS_ES_MYSQL_URL contains invalid unicode: {error}"
+                ));
+            }
+        };
+
+        let db_name = format!(
+            "ddd_test_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        let admin_url = get_admin_db_url(&base_url);
+        let test_url = get_test_db_url(&base_url, &db_name);
+
+        let mut conn = mysql::Conn::new(admin_url.as_str()).map_err(|error| {
+            format!("failed to connect to MySQL admin URL from DDD_CQRS_ES_MYSQL_URL: {error}")
+        })?;
+        use mysql::prelude::Queryable;
+        conn.query_drop(format!("CREATE DATABASE `{}`;", db_name))
+            .map_err(|error| {
+                format!("failed to create disposable MySQL database `{db_name}`: {error}")
+            })?;
+
+        Ok(Some(Self {
+            admin_url,
+            db_name,
+            test_url,
+        }))
+    }
+}
+
+#[cfg(feature = "mysql")]
+impl Drop for DisposableMySqlDb {
+    fn drop(&mut self) {
+        if let Ok(mut conn) = mysql::Conn::new(self.admin_url.as_str()) {
+            use mysql::prelude::Queryable;
+            let _ = conn.query_drop(format!("DROP DATABASE IF EXISTS `{}`;", self.db_name));
+        }
+    }
+}
+
+#[cfg(feature = "mysql")]
+fn mysql_test_db_or_skip(test_name: &str) -> Option<DisposableMySqlDb> {
+    match DisposableMySqlDb::new() {
+        Ok(Some(db)) => Some(db),
+        Ok(None) => {
+            eprintln!("skipping live MySQL {test_name}: DDD_CQRS_ES_MYSQL_URL is not set");
+            None
+        }
+        Err(error) => panic!("failed to prepare live MySQL {test_name}: {error}"),
+    }
+}
+
+#[cfg(feature = "mysql")]
+#[test]
+fn test_mysql_store_passes_reusable_contract_when_url_is_provided() {
+    let _guard = MYSQL_TEST_MUTEX.lock().unwrap();
+    let Some(db) = mysql_test_db_or_skip("contract test") else {
+        return;
+    };
+
+    let table_name = format!(
+        "events_live_contract_{}_{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+
+    let store = ddd_cqrs_es::MySqlEventStore::<Counter>::connect_with_table_name(
+        &db.test_url,
+        table_name.clone(),
+    )
+    .unwrap();
+    store.initialize_schema().unwrap();
+
+    assert_event_store_contract::<Counter, _>(
+        store,
+        "mysql-contract-counter".to_owned(),
+        CounterEvent::Created,
+        CounterEvent::Incremented { by: 1 },
+    );
+}
+
+#[cfg(feature = "mysql")]
+#[test]
+fn test_mysql_checkpoint_store() {
+    let _guard = MYSQL_TEST_MUTEX.lock().unwrap();
+    let Some(db) = mysql_test_db_or_skip("checkpoint test") else {
+        return;
+    };
+    use ddd_cqrs_es::projection::CheckpointStore;
+    use ddd_cqrs_es::MySqlCheckpointStore;
+
+    let conn = mysql::Conn::new(db.test_url.as_str()).unwrap();
+    let table_name = format!("checkpoints_{}", std::process::id());
+
+    let store = MySqlCheckpointStore::with_table_name(conn, table_name.clone()).unwrap();
+
+    assert_eq!(store.load_checkpoint("proj1").unwrap(), None);
+    store.save_checkpoint("proj1", 42).unwrap();
+    assert_eq!(store.load_checkpoint("proj1").unwrap(), Some(42));
+    store.save_checkpoint("proj1", 100).unwrap();
+    assert_eq!(store.load_checkpoint("proj1").unwrap(), Some(100));
+}
+
+#[cfg(feature = "mysql")]
+#[test]
+fn test_mysql_idempotency_store() {
+    let _guard = MYSQL_TEST_MUTEX.lock().unwrap();
+    let Some(db) = mysql_test_db_or_skip("idempotency test") else {
+        return;
+    };
+    use ddd_cqrs_es::MySqlIdempotencyStore;
+
+    let conn = mysql::Conn::new(db.test_url.as_str()).unwrap();
+    let table_name = format!("idempotency_{}", std::process::id());
+
+    let store = MySqlIdempotencyStore::with_table_name(conn, table_name.clone()).unwrap();
+
+    assert_sql_idempotency_store_contract(store);
 }

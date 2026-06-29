@@ -384,3 +384,196 @@ where
         Ok(applied)
     }
 }
+
+/// A projection that manages its own state and checkpoint persistence atomically.
+///
+/// # Note on Atomicity
+/// While this trait is designed to enable atomic updates, the atomicity itself depends entirely
+/// on the implementation of `apply_and_checkpoint` (e.g., executing the state modification and
+/// the checkpoint update within a single database transaction). The runner itself does not
+/// magically introduce or enforce atomicity for arbitrary non-transactional code.
+pub trait CheckpointedProjection<E, Id> {
+    /// Projection error.
+    type Error;
+
+    /// Stable projection name.
+    fn name(&self) -> &'static str;
+
+    /// Loads the last successfully processed event global sequence.
+    fn load_checkpoint(&self) -> Result<Option<u64>, Self::Error>;
+
+    /// Atomic operation to apply an event and persist its checkpoint.
+    ///
+    /// This should typically be executed within a transaction where both the state
+    /// modification and checkpoint update are committed atomically.
+    fn apply_and_checkpoint(&mut self, event: &EventEnvelope<E, Id>) -> Result<(), Self::Error>;
+}
+
+/// A projection runner for projections that manage their own checkpoints atomically.
+///
+/// # Note on Atomicity
+/// This runner coordinates the execution of projection updates but **does not** enforce or introduce
+/// database transactions itself. Atomicity of the event processing and checkpoint saving depends
+/// entirely on the underlying projection's implementation of `CheckpointedProjection::apply_and_checkpoint`.
+#[derive(Debug)]
+pub struct CheckpointedProjectionRunner<P> {
+    projection: P,
+}
+
+impl<P> CheckpointedProjectionRunner<P> {
+    /// Creates a new runner for a checkpointed projection.
+    pub fn new(projection: P) -> Self {
+        Self { projection }
+    }
+
+    /// Returns the wrapped projection.
+    pub fn projection(&self) -> &P {
+        &self.projection
+    }
+
+    /// Returns the wrapped projection mutably.
+    pub fn projection_mut(&mut self) -> &mut P {
+        &mut self.projection
+    }
+
+    /// Consumes the runner and returns the projection.
+    pub fn into_projection(self) -> P {
+        self.projection
+    }
+}
+
+impl<P> CheckpointedProjectionRunner<P> {
+    /// Loads global events after the current persistent checkpoint of the projection itself,
+    /// applies them atomically, and updates the checkpoint.
+    #[allow(clippy::type_complexity)]
+    pub fn run<A, S>(
+        &mut self,
+        store: &S,
+    ) -> Result<usize, ProjectionRunnerError<P::Error, S::Error, P::Error>>
+    where
+        A: Aggregate,
+        S: EventStore<A>,
+        P: CheckpointedProjection<A::Event, A::Id>,
+    {
+        let checkpoint = self
+            .projection
+            .load_checkpoint()
+            .map_err(ProjectionRunnerError::Checkpoint)?;
+
+        let events = store
+            .load_global_after(checkpoint)
+            .map_err(ProjectionRunnerError::Store)?;
+        let mut applied = 0;
+
+        for event in events {
+            self.projection
+                .apply_and_checkpoint(&event)
+                .map_err(ProjectionRunnerError::Projection)?;
+            applied += 1;
+        }
+
+        Ok(applied)
+    }
+}
+
+/// An async projection that manages its own state and checkpoint persistence atomically.
+///
+/// # Note on Atomicity
+/// While this trait is designed to enable atomic updates, the atomicity itself depends entirely
+/// on the implementation of `apply_and_checkpoint` (e.g., executing the state modification and
+/// the checkpoint update within a single database transaction). The runner itself does not
+/// magically introduce or enforce atomicity for arbitrary non-transactional code.
+#[cfg(feature = "async")]
+#[async_trait]
+pub trait AsyncCheckpointedProjection<E, Id> {
+    /// Projection error.
+    type Error;
+
+    /// Stable projection name.
+    fn name(&self) -> &'static str;
+
+    /// Loads the last successfully processed event global sequence.
+    async fn load_checkpoint(&self) -> Result<Option<u64>, Self::Error>;
+
+    /// Atomic operation to apply an event and persist its checkpoint.
+    ///
+    /// This should typically be executed within a transaction where both the state
+    /// modification and checkpoint update are committed atomically.
+    async fn apply_and_checkpoint(
+        &mut self,
+        event: &EventEnvelope<E, Id>,
+    ) -> Result<(), Self::Error>;
+}
+
+/// An async projection runner for projections that manage their own checkpoints atomically.
+///
+/// # Note on Atomicity
+/// This runner coordinates the execution of projection updates but **does not** enforce or introduce
+/// database transactions itself. Atomicity of the event processing and checkpoint saving depends
+/// entirely on the underlying projection's implementation of `AsyncCheckpointedProjection::apply_and_checkpoint`.
+#[cfg(feature = "async")]
+#[derive(Debug)]
+pub struct AsyncCheckpointedProjectionRunner<P> {
+    projection: P,
+}
+
+#[cfg(feature = "async")]
+impl<P> AsyncCheckpointedProjectionRunner<P> {
+    /// Creates a new async runner for a checkpointed projection.
+    pub fn new(projection: P) -> Self {
+        Self { projection }
+    }
+
+    /// Returns the wrapped projection.
+    pub fn projection(&self) -> &P {
+        &self.projection
+    }
+
+    /// Returns the wrapped projection mutably.
+    pub fn projection_mut(&mut self) -> &mut P {
+        &mut self.projection
+    }
+
+    /// Consumes the runner and returns the projection.
+    pub fn into_projection(self) -> P {
+        self.projection
+    }
+}
+
+#[cfg(feature = "async")]
+impl<P> AsyncCheckpointedProjectionRunner<P> {
+    /// Loads global events after the current persistent checkpoint of the projection itself,
+    /// applies them atomically, and updates the checkpoint.
+    #[allow(clippy::type_complexity)]
+    pub async fn run<A, S>(
+        &mut self,
+        store: &S,
+    ) -> Result<usize, ProjectionRunnerError<P::Error, S::Error, P::Error>>
+    where
+        A: Aggregate + Send + Sync,
+        S: crate::async_api::AsyncEventStore<A>,
+        P: AsyncCheckpointedProjection<A::Event, A::Id> + Send + Sync,
+    {
+        let checkpoint = self
+            .projection
+            .load_checkpoint()
+            .await
+            .map_err(ProjectionRunnerError::Checkpoint)?;
+
+        let events = store
+            .load_global_after(checkpoint)
+            .await
+            .map_err(ProjectionRunnerError::Store)?;
+        let mut applied = 0;
+
+        for event in events {
+            self.projection
+                .apply_and_checkpoint(&event)
+                .await
+                .map_err(ProjectionRunnerError::Projection)?;
+            applied += 1;
+        }
+
+        Ok(applied)
+    }
+}

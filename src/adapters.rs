@@ -1502,6 +1502,844 @@ pub fn execute_raw_tcp_postgres(
 }
 
 // -------------------------------------------------------------------------
+// Raw TCP MySQL adapter for generic WASI runtimes like Wasmtime
+// -------------------------------------------------------------------------
+#[cfg(feature = "wasi-mysql")]
+const MYSQL_CLIENT_LONG_PASSWORD: u32 = 0x0000_0001;
+#[cfg(feature = "wasi-mysql")]
+const MYSQL_CLIENT_LONG_FLAG: u32 = 0x0000_0004;
+#[cfg(feature = "wasi-mysql")]
+const MYSQL_CLIENT_CONNECT_WITH_DB: u32 = 0x0000_0008;
+#[cfg(feature = "wasi-mysql")]
+const MYSQL_CLIENT_PROTOCOL_41: u32 = 0x0000_0200;
+#[cfg(feature = "wasi-mysql")]
+const MYSQL_CLIENT_TRANSACTIONS: u32 = 0x0000_2000;
+#[cfg(feature = "wasi-mysql")]
+const MYSQL_CLIENT_SECURE_CONNECTION: u32 = 0x0000_8000;
+#[cfg(feature = "wasi-mysql")]
+const MYSQL_CLIENT_MULTI_RESULTS: u32 = 0x0002_0000;
+#[cfg(feature = "wasi-mysql")]
+const MYSQL_CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
+
+#[cfg(feature = "wasi-mysql")]
+#[derive(Clone, Debug)]
+struct MySqlConnParams {
+    host: String,
+    port: u16,
+    user: String,
+    password: Option<String>,
+    database: String,
+}
+
+#[cfg(feature = "wasi-mysql")]
+#[derive(Debug)]
+struct MySqlHandshake {
+    auth_plugin_name: String,
+    auth_plugin_data: Vec<u8>,
+}
+
+#[cfg(feature = "wasi-mysql")]
+#[derive(Clone, Debug)]
+struct MySqlColumn {
+    name: String,
+    column_type: u8,
+}
+
+#[cfg(feature = "wasi-mysql")]
+pub fn execute_raw_tcp_mysql(
+    url: &str,
+    sql: &str,
+    params: Vec<serde_json::Value>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let mysql_params = parse_mysql_url(url)?;
+    let addr = format!("{}:{}", mysql_params.host, mysql_params.port);
+    let mut stream = std::net::TcpStream::connect(&addr)
+        .map_err(|error| format!("Failed to connect to MySQL at {addr}: {error}"))?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .map_err(|error| format!("Failed to set MySQL read timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+        .map_err(|error| format!("Failed to set MySQL write timeout: {error}"))?;
+
+    mysql_authenticate(&mut stream, &mysql_params)?;
+
+    let interpolated = interpolate_mysql_query(sql, &params)?;
+    let sql_upper = interpolated.trim_start().to_ascii_uppercase();
+    let returns_rows = sql_upper.starts_with("SELECT") || sql_upper.contains("RETURNING");
+
+    if returns_rows {
+        let query_sql = interpolated.replace(" RETURNING sequence", "");
+        if query_sql != interpolated {
+            mysql_execute_query(&mut stream, &query_sql)?;
+            return mysql_execute_query(&mut stream, "SELECT LAST_INSERT_ID() AS sequence");
+        }
+    }
+
+    mysql_execute_query(&mut stream, &interpolated)
+}
+
+#[cfg(feature = "wasi-mysql")]
+fn parse_mysql_url(url: &str) -> Result<MySqlConnParams, String> {
+    let stripped = url
+        .strip_prefix("mysql://")
+        .ok_or_else(|| format!("Invalid MySQL URL prefix: {url}"))?;
+    let without_fragment = stripped.split_once('#').map_or(stripped, |(main, _)| main);
+    let without_query = without_fragment
+        .split_once('?')
+        .map_or(without_fragment, |(main, _)| main);
+    let (authority, database) = without_query
+        .split_once('/')
+        .ok_or_else(|| "MySQL URL must include a database name".to_string())?;
+    if database.is_empty() {
+        return Err("MySQL URL must include a database name".to_string());
+    }
+
+    let (auth, host_port) = authority
+        .rsplit_once('@')
+        .map_or((None, authority), |(auth, host_port)| {
+            (Some(auth), host_port)
+        });
+
+    let (user, password) = auth
+        .map(|auth| {
+            let (user, password) = auth.split_once(':').map_or((auth, ""), |parts| parts);
+            (
+                percent_decode(user),
+                (!password.is_empty()).then(|| percent_decode(password)),
+            )
+        })
+        .unwrap_or_else(|| ("root".to_string(), None));
+
+    let (host, port) = if host_port.starts_with('[') {
+        let end = host_port
+            .find(']')
+            .ok_or_else(|| "invalid bracketed IPv6 host in MySQL URL".to_string())?;
+        let host = host_port[1..end].to_string();
+        let rest = &host_port[end + 1..];
+        let port = rest
+            .strip_prefix(':')
+            .map(|port| {
+                port.parse::<u16>()
+                    .map_err(|error| format!("invalid MySQL port `{port}`: {error}"))
+            })
+            .transpose()?
+            .unwrap_or(3306);
+        (host, port)
+    } else {
+        match host_port.rsplit_once(':') {
+            Some((host, port)) => {
+                let port = port
+                    .parse::<u16>()
+                    .map_err(|error| format!("invalid MySQL port `{port}`: {error}"))?;
+                (host.to_string(), port)
+            }
+            None => (host_port.to_string(), 3306),
+        }
+    };
+
+    if host.is_empty() {
+        return Err("MySQL URL host is required".to_string());
+    }
+
+    Ok(MySqlConnParams {
+        host,
+        port,
+        user,
+        password,
+        database: percent_decode(database),
+    })
+}
+
+#[cfg(feature = "wasi-mysql")]
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+
+    while idx < bytes.len() {
+        if bytes[idx] == b'%' && idx + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex_value(bytes[idx + 1]), hex_value(bytes[idx + 2]))
+            {
+                output.push((high << 4) | low);
+                idx += 3;
+                continue;
+            }
+        }
+        output.push(bytes[idx]);
+        idx += 1;
+    }
+
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+#[cfg(feature = "wasi-mysql")]
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "wasi-mysql")]
+fn mysql_authenticate(
+    stream: &mut std::net::TcpStream,
+    params: &MySqlConnParams,
+) -> Result<(), String> {
+    let (handshake_packet, _) = mysql_read_packet(stream)?;
+    let handshake = mysql_parse_handshake(&handshake_packet)?;
+    let mut active_auth_seed = handshake.auth_plugin_data.clone();
+    let mut sequence_id = 1;
+    let auth_response = mysql_auth_response(
+        &handshake.auth_plugin_name,
+        params.password.as_deref().unwrap_or(""),
+        &active_auth_seed,
+    )?;
+    let response = mysql_handshake_response(params, &handshake.auth_plugin_name, &auth_response)?;
+    mysql_write_packet(stream, &mut sequence_id, &response)?;
+
+    loop {
+        let (packet, packet_sequence_id) = mysql_read_packet(stream)?;
+        if packet.is_empty() {
+            return Err("empty MySQL authentication packet".to_string());
+        }
+
+        match packet[0] {
+            0x00 => return Ok(()),
+            0xff => return Err(mysql_error_packet(&packet)),
+            0xfe if packet.len() > 1 => {
+                let (plugin, seed_start) = mysql_read_null_string(&packet, 1)?;
+                let seed = packet[seed_start..]
+                    .iter()
+                    .copied()
+                    .filter(|byte| *byte != 0)
+                    .collect::<Vec<_>>();
+                active_auth_seed = seed;
+                let auth_response = mysql_auth_response(
+                    &plugin,
+                    params.password.as_deref().unwrap_or(""),
+                    &active_auth_seed,
+                )?;
+                let mut response_sequence_id = packet_sequence_id.wrapping_add(1);
+                mysql_write_packet(stream, &mut response_sequence_id, &auth_response)?;
+            }
+            0x01 => {
+                let status = packet.get(1).copied().unwrap_or_default();
+                match status {
+                    0x03 => continue,
+                    0x04 => {
+                        mysql_continue_caching_sha2_full_auth(
+                            stream,
+                            params.password.as_deref().unwrap_or(""),
+                            &active_auth_seed,
+                            packet_sequence_id,
+                        )?;
+                        continue;
+                    }
+                    _ => return Err(format!("unsupported MySQL auth-more status: {status}")),
+                }
+            }
+            _ => return Err(format!("unexpected MySQL auth packet: 0x{:02x}", packet[0])),
+        }
+    }
+}
+
+#[cfg(feature = "wasi-mysql")]
+fn mysql_parse_handshake(payload: &[u8]) -> Result<MySqlHandshake, String> {
+    if payload.len() < 34 {
+        return Err("invalid MySQL handshake packet".to_string());
+    }
+
+    let mut idx = 0;
+    let _protocol = payload[idx];
+    idx += 1;
+    let (_, next_idx) = mysql_read_null_string(payload, idx)?;
+    idx = next_idx;
+    idx += 4;
+
+    if idx + 8 > payload.len() {
+        return Err("invalid MySQL handshake auth data part 1".to_string());
+    }
+    let mut auth_plugin_data = payload[idx..idx + 8].to_vec();
+    idx += 8;
+    idx += 1;
+
+    if idx + 2 > payload.len() {
+        return Err("invalid MySQL handshake capability flags".to_string());
+    }
+    let capability_lower = u16::from_le_bytes([payload[idx], payload[idx + 1]]) as u32;
+    idx += 2;
+
+    if idx >= payload.len() {
+        return Err("invalid MySQL handshake payload".to_string());
+    }
+    idx += 1;
+    idx += 2;
+
+    if idx + 2 > payload.len() {
+        return Err("invalid MySQL handshake upper capability flags".to_string());
+    }
+    let capability_upper = u16::from_le_bytes([payload[idx], payload[idx + 1]]) as u32;
+    idx += 2;
+    let capabilities = capability_lower | (capability_upper << 16);
+
+    let auth_plugin_data_len = payload.get(idx).copied().unwrap_or(21) as usize;
+    idx += 1;
+    idx += 10;
+
+    let part2_len = auth_plugin_data_len.saturating_sub(8).max(13);
+    let end = payload.len().min(idx + part2_len);
+    if idx < end {
+        auth_plugin_data.extend(payload[idx..end].iter().copied().filter(|byte| *byte != 0));
+        idx = end;
+    }
+
+    let auth_plugin_name = if capabilities & MYSQL_CLIENT_PLUGIN_AUTH != 0 && idx < payload.len() {
+        mysql_read_null_string(payload, idx)
+            .map(|(plugin, _)| plugin)
+            .unwrap_or_else(|_| "mysql_native_password".to_string())
+    } else {
+        "mysql_native_password".to_string()
+    };
+
+    Ok(MySqlHandshake {
+        auth_plugin_name,
+        auth_plugin_data,
+    })
+}
+
+#[cfg(feature = "wasi-mysql")]
+fn mysql_handshake_response(
+    params: &MySqlConnParams,
+    auth_plugin_name: &str,
+    auth_response: &[u8],
+) -> Result<Vec<u8>, String> {
+    let capabilities = MYSQL_CLIENT_LONG_PASSWORD
+        | MYSQL_CLIENT_LONG_FLAG
+        | MYSQL_CLIENT_CONNECT_WITH_DB
+        | MYSQL_CLIENT_PROTOCOL_41
+        | MYSQL_CLIENT_TRANSACTIONS
+        | MYSQL_CLIENT_SECURE_CONNECTION
+        | MYSQL_CLIENT_MULTI_RESULTS
+        | MYSQL_CLIENT_PLUGIN_AUTH;
+
+    if auth_response.len() > u8::MAX as usize {
+        return Err("MySQL auth response is too large".to_string());
+    }
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&capabilities.to_le_bytes());
+    payload.extend_from_slice(&(16_u32 * 1024 * 1024).to_le_bytes());
+    payload.push(45);
+    payload.extend_from_slice(&[0_u8; 23]);
+    payload.extend_from_slice(params.user.as_bytes());
+    payload.push(0);
+    payload.push(auth_response.len() as u8);
+    payload.extend_from_slice(auth_response);
+    payload.extend_from_slice(params.database.as_bytes());
+    payload.push(0);
+    payload.extend_from_slice(auth_plugin_name.as_bytes());
+    payload.push(0);
+
+    Ok(payload)
+}
+
+#[cfg(feature = "wasi-mysql")]
+fn mysql_auth_response(plugin: &str, password: &str, seed: &[u8]) -> Result<Vec<u8>, String> {
+    if password.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    match plugin {
+        "mysql_native_password" => Ok(mysql_native_password_token(password, seed).to_vec()),
+        "caching_sha2_password" => Ok(mysql_caching_sha2_token(password, seed).to_vec()),
+        "mysql_clear_password" => {
+            let mut response = password.as_bytes().to_vec();
+            response.push(0);
+            Ok(response)
+        }
+        plugin => Err(format!("unsupported MySQL auth plugin `{plugin}`")),
+    }
+}
+
+#[cfg(feature = "wasi-mysql")]
+fn mysql_continue_caching_sha2_full_auth(
+    stream: &mut std::net::TcpStream,
+    password: &str,
+    seed: &[u8],
+    packet_sequence_id: u8,
+) -> Result<(), String> {
+    let mut request_sequence_id = packet_sequence_id.wrapping_add(1);
+    mysql_write_packet(stream, &mut request_sequence_id, &[0x02])?;
+
+    let (key_packet, key_packet_sequence_id) = mysql_read_packet(stream)?;
+    let public_key = mysql_public_key_from_packet(&key_packet)?;
+    let encrypted_password = mysql_encrypt_caching_sha2_password(password, seed, public_key)?;
+
+    let mut auth_sequence_id = key_packet_sequence_id.wrapping_add(1);
+    mysql_write_packet(stream, &mut auth_sequence_id, &encrypted_password)?;
+    Ok(())
+}
+
+#[cfg(feature = "wasi-mysql")]
+fn mysql_public_key_from_packet(packet: &[u8]) -> Result<&[u8], String> {
+    if packet.is_empty() {
+        return Err("empty MySQL caching_sha2_password public-key packet".to_string());
+    }
+    if packet[0] == 0xff {
+        return Err(mysql_error_packet(packet));
+    }
+
+    let public_key = if packet[0] == 0x01 {
+        &packet[1..]
+    } else {
+        packet
+    };
+
+    if public_key.is_empty() {
+        return Err("MySQL caching_sha2_password public key is empty".to_string());
+    }
+
+    Ok(public_key)
+}
+
+#[cfg(feature = "wasi-mysql")]
+fn mysql_encrypt_caching_sha2_password(
+    password: &str,
+    seed: &[u8],
+    public_key_pem: &[u8],
+) -> Result<Vec<u8>, String> {
+    use rsa::{pkcs1::DecodeRsaPublicKey, pkcs8::DecodePublicKey, Oaep, RsaPublicKey};
+
+    if seed.is_empty() {
+        return Err("MySQL caching_sha2_password auth seed is empty".to_string());
+    }
+
+    let public_key_pem = std::str::from_utf8(public_key_pem)
+        .map_err(|error| format!("invalid MySQL RSA public key UTF-8: {error}"))?;
+    let public_key = RsaPublicKey::from_public_key_pem(public_key_pem)
+        .or_else(|_| RsaPublicKey::from_pkcs1_pem(public_key_pem))
+        .map_err(|error| format!("failed to parse MySQL RSA public key: {error}"))?;
+
+    let mut scrambled_password = password.as_bytes().to_vec();
+    scrambled_password.push(0);
+    for (index, byte) in scrambled_password.iter_mut().enumerate() {
+        *byte ^= seed[index % seed.len()];
+    }
+
+    let mut rng = MySqlAuthRng;
+    public_key
+        .encrypt(&mut rng, Oaep::new::<sha1::Sha1>(), &scrambled_password)
+        .map_err(|error| format!("failed to encrypt MySQL caching_sha2_password response: {error}"))
+}
+
+#[cfg(feature = "wasi-mysql")]
+struct MySqlAuthRng;
+
+#[cfg(feature = "wasi-mysql")]
+impl rsa::rand_core::RngCore for MySqlAuthRng {
+    fn next_u32(&mut self) -> u32 {
+        let mut bytes = [0_u8; 4];
+        self.fill_bytes(&mut bytes);
+        u32::from_le_bytes(bytes)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut bytes = [0_u8; 8];
+        self.fill_bytes(&mut bytes);
+        u64::from_le_bytes(bytes)
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        self.try_fill_bytes(dest)
+            .unwrap_or_else(|error| panic!("failed to read random bytes for MySQL auth: {error}"));
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rsa::rand_core::Error> {
+        getrandom::fill(dest).map_err(|error| {
+            rsa::rand_core::Error::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("getrandom failed for MySQL auth: {error}"),
+            ))
+        })
+    }
+}
+
+#[cfg(feature = "wasi-mysql")]
+impl rsa::rand_core::CryptoRng for MySqlAuthRng {}
+
+#[cfg(feature = "wasi-mysql")]
+fn mysql_native_password_token(password: &str, seed: &[u8]) -> [u8; 20] {
+    let stage1 = mysql_sha1(password.as_bytes());
+    let stage2 = mysql_sha1(&stage1);
+    let mut challenge = Vec::with_capacity(seed.len() + stage2.len());
+    challenge.extend_from_slice(seed);
+    challenge.extend_from_slice(&stage2);
+    let stage3 = mysql_sha1(&challenge);
+    let mut token = [0_u8; 20];
+    for index in 0..20 {
+        token[index] = stage1[index] ^ stage3[index];
+    }
+    token
+}
+
+#[cfg(feature = "wasi-mysql")]
+fn mysql_caching_sha2_token(password: &str, seed: &[u8]) -> [u8; 32] {
+    let stage1 = mysql_sha256(password.as_bytes());
+    let stage2 = mysql_sha256(&stage1);
+    let stage3 = mysql_sha256(&stage2);
+    let mut challenge = Vec::with_capacity(stage3.len() + seed.len());
+    challenge.extend_from_slice(&stage3);
+    challenge.extend_from_slice(seed);
+    let stage4 = mysql_sha256(&challenge);
+    let mut token = [0_u8; 32];
+    for index in 0..32 {
+        token[index] = stage1[index] ^ stage4[index];
+    }
+    token
+}
+
+#[cfg(feature = "wasi-mysql")]
+fn mysql_sha1(bytes: &[u8]) -> [u8; 20] {
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+#[cfg(feature = "wasi-mysql")]
+fn mysql_sha256(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+#[cfg(feature = "wasi-mysql")]
+fn mysql_execute_query(
+    stream: &mut std::net::TcpStream,
+    sql: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut sequence_id = 0;
+    let mut payload = Vec::with_capacity(sql.len() + 1);
+    payload.push(0x03);
+    payload.extend_from_slice(sql.as_bytes());
+    mysql_write_packet(stream, &mut sequence_id, &payload)?;
+
+    let (first_packet, _) = mysql_read_packet(stream)?;
+    if first_packet.is_empty() {
+        return Err("empty MySQL query response".to_string());
+    }
+    if first_packet[0] == 0xff {
+        return Err(mysql_error_packet(&first_packet));
+    }
+    if mysql_is_ok_or_eof_packet(&first_packet) {
+        return Ok(Vec::new());
+    }
+
+    let mut idx = 0;
+    let column_count = mysql_read_lenenc_int(&first_packet, &mut idx)?
+        .ok_or_else(|| "MySQL column count cannot be NULL".to_string())?
+        as usize;
+    let mut columns = Vec::with_capacity(column_count);
+    for _ in 0..column_count {
+        let (packet, _) = mysql_read_packet(stream)?;
+        if packet.first() == Some(&0xff) {
+            return Err(mysql_error_packet(&packet));
+        }
+        columns.push(mysql_parse_column_definition(&packet)?);
+    }
+
+    let (terminator, _) = mysql_read_packet(stream)?;
+    if terminator.first() == Some(&0xff) {
+        return Err(mysql_error_packet(&terminator));
+    }
+
+    let mut rows = Vec::new();
+    loop {
+        let (packet, _) = mysql_read_packet(stream)?;
+        if packet.first() == Some(&0xff) {
+            return Err(mysql_error_packet(&packet));
+        }
+        if mysql_is_ok_or_eof_packet(&packet) {
+            break;
+        }
+        rows.push(mysql_parse_text_row(&packet, &columns)?);
+    }
+
+    Ok(rows)
+}
+
+#[cfg(feature = "wasi-mysql")]
+fn mysql_parse_column_definition(payload: &[u8]) -> Result<MySqlColumn, String> {
+    let mut idx = 0;
+    for _ in 0..4 {
+        let _ = mysql_read_lenenc_bytes(payload, &mut idx)?;
+    }
+    let name = mysql_read_lenenc_bytes(payload, &mut idx)?
+        .ok_or_else(|| "MySQL column name cannot be NULL".to_string())
+        .and_then(|bytes| {
+            std::str::from_utf8(bytes)
+                .map(|value| value.to_string())
+                .map_err(|error| format!("invalid MySQL column name UTF-8: {error}"))
+        })?;
+    let _ = mysql_read_lenenc_bytes(payload, &mut idx)?;
+
+    if idx + 13 > payload.len() {
+        return Err("invalid MySQL column definition packet".to_string());
+    }
+    idx += 1;
+    idx += 2;
+    idx += 4;
+    let column_type = payload[idx];
+
+    Ok(MySqlColumn { name, column_type })
+}
+
+#[cfg(feature = "wasi-mysql")]
+fn mysql_parse_text_row(
+    payload: &[u8],
+    columns: &[MySqlColumn],
+) -> Result<serde_json::Value, String> {
+    let mut idx = 0;
+    let mut row = serde_json::Map::new();
+
+    for column in columns {
+        let value = mysql_read_lenenc_bytes(payload, &mut idx)?;
+        let json_value = match value {
+            None => serde_json::Value::Null,
+            Some(bytes) => mysql_text_value_to_json(column, bytes),
+        };
+        row.insert(column.name.clone(), json_value);
+    }
+
+    Ok(serde_json::Value::Object(row))
+}
+
+#[cfg(feature = "wasi-mysql")]
+fn mysql_text_value_to_json(column: &MySqlColumn, bytes: &[u8]) -> serde_json::Value {
+    let text = String::from_utf8_lossy(bytes);
+    match column.column_type {
+        0x01 | 0x02 | 0x03 | 0x08 | 0x09 | 0x0d => text
+            .parse::<i64>()
+            .map(|value| serde_json::Value::Number(value.into()))
+            .unwrap_or_else(|_| serde_json::Value::String(text.into_owned())),
+        0x04 | 0x05 | 0xf6 => text
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map(serde_json::Value::Number)
+            .unwrap_or_else(|| serde_json::Value::String(text.into_owned())),
+        0xf5 => serde_json::from_str::<serde_json::Value>(&text)
+            .unwrap_or_else(|_| serde_json::Value::String(text.into_owned())),
+        _ => serde_json::Value::String(text.into_owned()),
+    }
+}
+
+#[cfg(feature = "wasi-mysql")]
+fn mysql_read_packet(stream: &mut std::net::TcpStream) -> Result<(Vec<u8>, u8), String> {
+    use std::io::Read;
+
+    let mut payload = Vec::new();
+
+    loop {
+        let mut header = [0_u8; 4];
+        stream
+            .read_exact(&mut header)
+            .map_err(|error| format!("failed to read MySQL packet header: {error}"))?;
+        let len = (header[0] as usize) | ((header[1] as usize) << 8) | ((header[2] as usize) << 16);
+        let sequence_id = header[3];
+        let mut chunk = vec![0_u8; len];
+        stream
+            .read_exact(&mut chunk)
+            .map_err(|error| format!("failed to read MySQL packet payload: {error}"))?;
+        payload.extend_from_slice(&chunk);
+        if len < 0x00ff_ffff {
+            return Ok((payload, sequence_id));
+        }
+    }
+}
+
+#[cfg(feature = "wasi-mysql")]
+fn mysql_write_packet(
+    stream: &mut std::net::TcpStream,
+    sequence_id: &mut u8,
+    payload: &[u8],
+) -> Result<(), String> {
+    use std::io::Write;
+
+    if payload.len() > 0x00ff_ffff {
+        return Err("MySQL packet payload exceeds 16MiB".to_string());
+    }
+
+    let len = payload.len();
+    let header = [
+        (len & 0xff) as u8,
+        ((len >> 8) & 0xff) as u8,
+        ((len >> 16) & 0xff) as u8,
+        *sequence_id,
+    ];
+    stream
+        .write_all(&header)
+        .map_err(|error| format!("failed to write MySQL packet header: {error}"))?;
+    stream
+        .write_all(payload)
+        .map_err(|error| format!("failed to write MySQL packet payload: {error}"))?;
+    stream
+        .flush()
+        .map_err(|error| format!("failed to flush MySQL packet: {error}"))?;
+    *sequence_id = sequence_id.wrapping_add(1);
+    Ok(())
+}
+
+#[cfg(feature = "wasi-mysql")]
+fn mysql_read_null_string(payload: &[u8], start: usize) -> Result<(String, usize), String> {
+    if start > payload.len() {
+        return Err("invalid MySQL null string offset".to_string());
+    }
+    let mut end = start;
+    while end < payload.len() && payload[end] != 0 {
+        end += 1;
+    }
+    let value = std::str::from_utf8(&payload[start..end])
+        .map_err(|error| format!("invalid MySQL UTF-8 string: {error}"))?
+        .to_string();
+    Ok((value, (end + 1).min(payload.len())))
+}
+
+#[cfg(feature = "wasi-mysql")]
+fn mysql_read_lenenc_int(payload: &[u8], idx: &mut usize) -> Result<Option<u64>, String> {
+    if *idx >= payload.len() {
+        return Err("unexpected end of MySQL length-encoded integer".to_string());
+    }
+    let first = payload[*idx];
+    *idx += 1;
+    match first {
+        0xfb => Ok(None),
+        0xfc => {
+            if *idx + 2 > payload.len() {
+                return Err("invalid MySQL 2-byte length-encoded integer".to_string());
+            }
+            let value = u16::from_le_bytes([payload[*idx], payload[*idx + 1]]) as u64;
+            *idx += 2;
+            Ok(Some(value))
+        }
+        0xfd => {
+            if *idx + 3 > payload.len() {
+                return Err("invalid MySQL 3-byte length-encoded integer".to_string());
+            }
+            let value = (payload[*idx] as u64)
+                | ((payload[*idx + 1] as u64) << 8)
+                | ((payload[*idx + 2] as u64) << 16);
+            *idx += 3;
+            Ok(Some(value))
+        }
+        0xfe => {
+            if *idx + 8 > payload.len() {
+                return Err("invalid MySQL 8-byte length-encoded integer".to_string());
+            }
+            let value = u64::from_le_bytes([
+                payload[*idx],
+                payload[*idx + 1],
+                payload[*idx + 2],
+                payload[*idx + 3],
+                payload[*idx + 4],
+                payload[*idx + 5],
+                payload[*idx + 6],
+                payload[*idx + 7],
+            ]);
+            *idx += 8;
+            Ok(Some(value))
+        }
+        value => Ok(Some(value as u64)),
+    }
+}
+
+#[cfg(feature = "wasi-mysql")]
+fn mysql_read_lenenc_bytes<'a>(
+    payload: &'a [u8],
+    idx: &mut usize,
+) -> Result<Option<&'a [u8]>, String> {
+    let Some(len) = mysql_read_lenenc_int(payload, idx)? else {
+        return Ok(None);
+    };
+    let len = len as usize;
+    if *idx + len > payload.len() {
+        return Err("invalid MySQL length-encoded string length".to_string());
+    }
+    let bytes = &payload[*idx..*idx + len];
+    *idx += len;
+    Ok(Some(bytes))
+}
+
+#[cfg(feature = "wasi-mysql")]
+fn mysql_is_ok_or_eof_packet(packet: &[u8]) -> bool {
+    packet.first() == Some(&0x00) || (packet.first() == Some(&0xfe) && packet.len() < 9)
+}
+
+#[cfg(feature = "wasi-mysql")]
+fn mysql_error_packet(packet: &[u8]) -> String {
+    if packet.len() < 3 || packet[0] != 0xff {
+        return format!("MySQL error packet: {packet:?}");
+    }
+    let code = u16::from_le_bytes([packet[1], packet[2]]);
+    let message_start = if packet.get(3) == Some(&b'#') && packet.len() >= 9 {
+        9
+    } else {
+        3
+    };
+    let message = String::from_utf8_lossy(packet.get(message_start..).unwrap_or_default());
+    format!("MySQL error {code}: {message}")
+}
+
+#[cfg(feature = "wasi-mysql")]
+fn interpolate_mysql_query(sql: &str, params: &[serde_json::Value]) -> Result<String, String> {
+    let mut output = String::with_capacity(sql.len() + params.len() * 8);
+    let mut params_iter = params.iter();
+
+    for ch in sql.chars() {
+        if ch == '?' {
+            let value = params_iter
+                .next()
+                .ok_or_else(|| "not enough MySQL query parameters".to_string())?;
+            output.push_str(&format_mysql_value(value)?);
+        } else {
+            output.push(ch);
+        }
+    }
+
+    if params_iter.next().is_some() {
+        return Err("too many MySQL query parameters".to_string());
+    }
+
+    Ok(output)
+}
+
+#[cfg(feature = "wasi-mysql")]
+fn format_mysql_value(value: &serde_json::Value) -> Result<String, String> {
+    match value {
+        serde_json::Value::Null => Ok("NULL".to_string()),
+        serde_json::Value::Bool(value) => Ok(if *value { "TRUE" } else { "FALSE" }.to_string()),
+        serde_json::Value::Number(value) => Ok(value.to_string()),
+        serde_json::Value::String(value) => Ok(format!("'{}'", escape_mysql_string(value))),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            let value = serde_json::to_string(value).map_err(|error| error.to_string())?;
+            Ok(format!("'{}'", escape_mysql_string(&value)))
+        }
+    }
+}
+
+#[cfg(feature = "wasi-mysql")]
+fn escape_mysql_string(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\0', "\\0")
+        .replace('\'', "''")
+}
+
+// -------------------------------------------------------------------------
 // Spin SQLite adapter
 // -------------------------------------------------------------------------
 #[cfg(feature = "spin-sqlite")]
@@ -1685,5 +2523,617 @@ pub async fn execute_spin_pg(
             .await
             .map_err(|e| format!("Pg execute error: {:?}", e))?;
         Ok(Vec::new())
+    }
+}
+
+// -------------------------------------------------------------------------
+// Spin MySQL adapter
+// -------------------------------------------------------------------------
+#[cfg(feature = "spin-mysql")]
+pub async fn execute_spin_mysql(
+    db_url: &str,
+    sql: &str,
+    params: Vec<serde_json::Value>,
+) -> Result<Vec<serde_json::Value>, String> {
+    use spin_sdk::mysql::{Connection as SpinMysqlConn, ParameterValue as SpinMysqlParam};
+
+    let mysql_params: Vec<SpinMysqlParam> = params
+        .into_iter()
+        .map(|value| match value {
+            serde_json::Value::Null => SpinMysqlParam::DbNull,
+            serde_json::Value::Bool(value) => SpinMysqlParam::Int8(if value { 1 } else { 0 }),
+            serde_json::Value::Number(value) => {
+                if let Some(value) = value.as_i64() {
+                    SpinMysqlParam::Int64(value)
+                } else if let Some(value) = value.as_u64() {
+                    SpinMysqlParam::Uint64(value)
+                } else if let Some(value) = value.as_f64() {
+                    SpinMysqlParam::Floating64(value)
+                } else {
+                    SpinMysqlParam::DbNull
+                }
+            }
+            serde_json::Value::String(value) => SpinMysqlParam::Str(value),
+            value => SpinMysqlParam::Str(value.to_string()),
+        })
+        .collect();
+
+    let sql_upper = sql.trim_start().to_ascii_uppercase();
+    let returns_rows = sql_upper.starts_with("SELECT") || sql_upper.contains("RETURNING");
+    let conn = SpinMysqlConn::open(db_url)
+        .map_err(|error| format!("MySQL connection error: {error:?}"))?;
+
+    if returns_rows {
+        let query_sql = sql.replace(" RETURNING sequence", "");
+        if query_sql != sql {
+            conn.execute(&query_sql, &mysql_params)
+                .map_err(|error| format!("MySQL execute error: {error:?}"))?;
+            return spin_mysql_query_rows(&conn, "SELECT LAST_INSERT_ID() AS sequence", &[]);
+        }
+
+        let query_sql = spin_mysql_select_sql(sql);
+        spin_mysql_query_rows(&conn, &query_sql, &mysql_params)
+    } else {
+        conn.execute(sql, &mysql_params)
+            .map_err(|error| format!("MySQL execute error: {error:?}"))?;
+        Ok(Vec::new())
+    }
+}
+
+#[cfg(feature = "spin-mysql")]
+fn spin_mysql_select_sql(sql: &str) -> String {
+    // Spin's MySQL SDK cannot currently convert MySQL JSON columns directly;
+    // cast event JSON columns to strings before RowSet decoding.
+    if sql.contains(" AS payload") {
+        return sql.to_string();
+    }
+
+    sql.replace(
+        "payload, metadata",
+        "CAST(payload AS CHAR(10000) CHARACTER SET utf8mb4) AS payload, CAST(metadata AS CHAR(10000) CHARACTER SET utf8mb4) AS metadata",
+    )
+    .replace(
+        "payload, recorded_at_ms",
+        "CAST(payload AS CHAR(10000) CHARACTER SET utf8mb4) AS payload, recorded_at_ms",
+    )
+}
+
+#[cfg(feature = "spin-mysql")]
+fn spin_mysql_query_rows(
+    conn: &spin_sdk::mysql::Connection,
+    sql: &str,
+    params: &[spin_sdk::mysql::ParameterValue],
+) -> Result<Vec<serde_json::Value>, String> {
+    let rowset = conn
+        .query(sql, params)
+        .map_err(|error| format!("MySQL query error: {error:?}"))?;
+    let col_names: Vec<String> = rowset.columns.iter().map(|col| col.name.clone()).collect();
+    let mut rows = Vec::with_capacity(rowset.rows.len());
+
+    for row in &rowset.rows {
+        let mut row_obj = serde_json::Map::new();
+        for (index, value) in row.iter().enumerate() {
+            let col_name = col_names
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| format!("col_{index}"));
+            row_obj.insert(col_name, spin_mysql_value_to_json(value));
+        }
+        rows.push(serde_json::Value::Object(row_obj));
+    }
+
+    Ok(rows)
+}
+
+#[cfg(feature = "spin-mysql")]
+fn spin_mysql_value_to_json(value: &spin_sdk::mysql::DbValue) -> serde_json::Value {
+    use spin_sdk::mysql::DbValue as SpinMysqlDbVal;
+
+    match value {
+        SpinMysqlDbVal::DbNull => serde_json::Value::Null,
+        SpinMysqlDbVal::Int8(value) => serde_json::Value::Number((*value as i32).into()),
+        SpinMysqlDbVal::Int16(value) => serde_json::Value::Number((*value as i32).into()),
+        SpinMysqlDbVal::Int32(value) => serde_json::Value::Number((*value).into()),
+        SpinMysqlDbVal::Int64(value) => serde_json::Value::Number((*value).into()),
+        SpinMysqlDbVal::Uint8(value) => serde_json::Value::Number((*value as u32).into()),
+        SpinMysqlDbVal::Uint16(value) => serde_json::Value::Number((*value as u32).into()),
+        SpinMysqlDbVal::Uint32(value) => serde_json::Value::Number((*value).into()),
+        SpinMysqlDbVal::Uint64(value) => serde_json::Value::Number((*value).into()),
+        SpinMysqlDbVal::Floating32(value) => serde_json::Number::from_f64(*value as f64)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        SpinMysqlDbVal::Floating64(value) => serde_json::Number::from_f64(*value)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        SpinMysqlDbVal::Str(value) => serde_json::from_str::<serde_json::Value>(value)
+            .unwrap_or_else(|_| serde_json::Value::String(value.clone())),
+        SpinMysqlDbVal::Binary(value) => {
+            serde_json::Value::String(String::from_utf8_lossy(value).into_owned())
+        }
+        other => serde_json::Value::String(format!("{other:?}")),
+    }
+}
+
+// =========================================================================
+// FLAT-FILE FALLBACK STORAGE IMPLEMENTATIONS
+// =========================================================================
+
+#[cfg(feature = "json-file")]
+static FILE_LOCKS: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<std::path::PathBuf, std::sync::Arc<std::sync::Mutex<()>>>,
+    >,
+> = std::sync::OnceLock::new();
+
+#[cfg(feature = "json-file")]
+fn get_file_lock(path: &std::path::Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+    let map_lock =
+        FILE_LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut map = map_lock.lock().unwrap();
+    let canonical = if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+        if let Ok(canon_parent) = parent.canonicalize() {
+            if let Some(filename) = path.file_name() {
+                canon_parent.join(filename)
+            } else {
+                canon_parent
+            }
+        } else {
+            path.to_path_buf()
+        }
+    } else {
+        path.to_path_buf()
+    };
+    map.entry(canonical)
+        .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
+        .clone()
+}
+
+#[cfg(feature = "json-file")]
+fn write_atomic(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp_name = format!(
+        "{}.tmp.{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        nanos
+    );
+    let tmp_path = path.with_file_name(tmp_name);
+    std::fs::write(&tmp_path, content)?;
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "json-file")]
+/// A JSON file-backed event store.
+///
+/// > [!WARNING]
+/// > This adapter is intended for **single-process development and testing purposes only**.
+/// > It is not designed or certified for production use-cases where high concurrency,
+/// > multi-process access, or strict reliability guarantees are required.
+pub struct JsonFileEventStore<A> {
+    events_path: std::path::PathBuf,
+    _marker: std::marker::PhantomData<fn() -> A>,
+}
+
+#[cfg(feature = "json-file")]
+impl<A> Clone for JsonFileEventStore<A> {
+    fn clone(&self) -> Self {
+        Self {
+            events_path: self.events_path.clone(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "json-file")]
+impl<A> std::fmt::Debug for JsonFileEventStore<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JsonFileEventStore")
+            .field("events_path", &self.events_path)
+            .finish()
+    }
+}
+
+#[cfg(feature = "json-file")]
+impl<A> JsonFileEventStore<A> {
+    /// Creates a new JSON file-backed event store.
+    pub fn new(events_path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            events_path: events_path.into(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "json-file")]
+impl<A> crate::event_store::EventStore<A> for JsonFileEventStore<A>
+where
+    A: crate::aggregate::Aggregate + 'static,
+    A::Event: serde::Serialize + serde::de::DeserializeOwned + Clone,
+    A::Id: serde::Serialize + serde::de::DeserializeOwned + Clone + PartialEq,
+{
+    type Error = crate::error::EventStoreError;
+
+    fn load(
+        &self,
+        aggregate_id: &A::Id,
+    ) -> Result<crate::event_store::EventStream<A>, Self::Error> {
+        let lock = get_file_lock(&self.events_path);
+        let _guard = lock.lock().unwrap();
+
+        if !self.events_path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let content = std::fs::read_to_string(&self.events_path)
+            .map_err(|e| crate::error::EventStoreError::Backend(e.to_string()))?;
+
+        let values: Vec<serde_json::Value> = serde_json::from_str(&content)
+            .map_err(|e| crate::error::EventStoreError::Deserialization(e.to_string()))?;
+
+        let mut envelopes = Vec::new();
+        for val in values {
+            if let Some(agg_type_val) = val.get("aggregate_type") {
+                if let Some(agg_type_str) = agg_type_val.as_str() {
+                    if agg_type_str == A::aggregate_type() {
+                        let id_val = val.get("aggregate_id").ok_or_else(|| {
+                            crate::error::EventStoreError::Deserialization(
+                                "missing aggregate_id".to_string(),
+                            )
+                        })?;
+                        let id = serde_json::from_value::<A::Id>(id_val.clone()).map_err(|e| {
+                            crate::error::EventStoreError::Deserialization(format!(
+                                "failed to deserialize aggregate_id: {e}"
+                            ))
+                        })?;
+                        if &id == aggregate_id {
+                            let envelope = serde_json::from_value::<
+                                crate::event::EventEnvelope<A::Event, A::Id>,
+                            >(val)
+                            .map_err(|e| {
+                                crate::error::EventStoreError::Deserialization(format!(
+                                    "failed to deserialize event envelope: {e}"
+                                ))
+                            })?;
+                            envelopes.push(envelope);
+                        }
+                    }
+                }
+            }
+        }
+
+        envelopes.sort_by_key(|e| e.revision);
+        Ok(envelopes)
+    }
+
+    fn append(
+        &self,
+        aggregate_id: &A::Id,
+        expected_revision: crate::event::ExpectedRevision,
+        events: Vec<crate::event::NewEvent<A::Event>>,
+    ) -> Result<crate::event_store::EventStream<A>, Self::Error> {
+        let lock = get_file_lock(&self.events_path);
+        let _guard = lock.lock().unwrap();
+
+        if let Some(parent) = self.events_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let content = if self.events_path.exists() {
+            std::fs::read_to_string(&self.events_path)
+                .map_err(|e| crate::error::EventStoreError::Backend(e.to_string()))?
+        } else {
+            "[]".to_string()
+        };
+
+        let mut all_values: Vec<serde_json::Value> = serde_json::from_str(&content)
+            .map_err(|e| crate::error::EventStoreError::Deserialization(e.to_string()))?;
+
+        let mut current_revision = 0u64;
+        let mut max_sequence = 0u64;
+
+        for val in &all_values {
+            if let Some(seq) = val.get("sequence").and_then(|s| s.as_u64()) {
+                if seq > max_sequence {
+                    max_sequence = seq;
+                }
+            }
+
+            if let Some(agg_type_val) = val.get("aggregate_type") {
+                if let Some(agg_type_str) = agg_type_val.as_str() {
+                    if agg_type_str == A::aggregate_type() {
+                        let id_val = val.get("aggregate_id").ok_or_else(|| {
+                            crate::error::EventStoreError::Deserialization(
+                                "missing aggregate_id".to_string(),
+                            )
+                        })?;
+                        let id = serde_json::from_value::<A::Id>(id_val.clone()).map_err(|e| {
+                            crate::error::EventStoreError::Deserialization(format!(
+                                "failed to deserialize aggregate_id: {e}"
+                            ))
+                        })?;
+                        if &id == aggregate_id {
+                            let rev = val
+                                .get("revision")
+                                .ok_or_else(|| {
+                                    crate::error::EventStoreError::Deserialization(
+                                        "missing revision".to_string(),
+                                    )
+                                })?
+                                .as_u64()
+                                .ok_or_else(|| {
+                                    crate::error::EventStoreError::Deserialization(
+                                        "revision is not a valid u64".to_string(),
+                                    )
+                                })?;
+                            if rev > current_revision {
+                                current_revision = rev;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        match expected_revision {
+            crate::event::ExpectedRevision::Any => {}
+            crate::event::ExpectedRevision::NoStream if current_revision == 0 => {}
+            crate::event::ExpectedRevision::NoStream => {
+                return Err(crate::error::EventStoreError::Concurrency(
+                    crate::error::ConcurrencyError::StreamAlreadyExists,
+                ));
+            }
+            crate::event::ExpectedRevision::Exact(expected) if expected == current_revision => {}
+            crate::event::ExpectedRevision::Exact(_) => {
+                return Err(crate::error::EventStoreError::Concurrency(
+                    crate::error::ConcurrencyError::WrongExpectedRevision {
+                        expected: expected_revision,
+                        actual: current_revision,
+                    },
+                ));
+            }
+        }
+
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut envelopes = Vec::new();
+        let now = std::time::SystemTime::now();
+
+        for (i, event) in events.into_iter().enumerate() {
+            let revision = current_revision + i as u64 + 1;
+            let sequence = max_sequence + i as u64 + 1;
+            let event_id = crate::event::EventId::new();
+
+            let envelope = crate::event::EventEnvelope::new(
+                event_id,
+                aggregate_id.clone(),
+                A::aggregate_type().to_string(),
+                revision,
+                Some(sequence),
+                event.event_type,
+                event.event_version,
+                event.payload,
+                event.metadata,
+                now,
+            );
+
+            let val = serde_json::to_value(&envelope)
+                .map_err(|e| crate::error::EventStoreError::Serialization(e.to_string()))?;
+
+            all_values.push(val);
+            envelopes.push(envelope);
+        }
+
+        let new_content = serde_json::to_string(&all_values)
+            .map_err(|e| crate::error::EventStoreError::Serialization(e.to_string()))?;
+        write_atomic(&self.events_path, &new_content)
+            .map_err(|e| crate::error::EventStoreError::Backend(e.to_string()))?;
+
+        Ok(envelopes)
+    }
+
+    fn load_global_after(
+        &self,
+        sequence: Option<u64>,
+    ) -> Result<crate::event_store::EventStream<A>, Self::Error> {
+        let lock = get_file_lock(&self.events_path);
+        let _guard = lock.lock().unwrap();
+
+        if !self.events_path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let content = std::fs::read_to_string(&self.events_path)
+            .map_err(|e| crate::error::EventStoreError::Backend(e.to_string()))?;
+
+        let values: Vec<serde_json::Value> = serde_json::from_str(&content)
+            .map_err(|e| crate::error::EventStoreError::Deserialization(e.to_string()))?;
+
+        let mut envelopes = Vec::new();
+        let seq_num = sequence.unwrap_or(0);
+        for val in values {
+            if let Some(agg_type_val) = val.get("aggregate_type") {
+                if let Some(agg_type_str) = agg_type_val.as_str() {
+                    if agg_type_str == A::aggregate_type() {
+                        let envelope = serde_json::from_value::<
+                            crate::event::EventEnvelope<A::Event, A::Id>,
+                        >(val)
+                        .map_err(|e| {
+                            crate::error::EventStoreError::Deserialization(format!(
+                                "failed to deserialize event envelope: {e}"
+                            ))
+                        })?;
+                        if envelope.sequence.unwrap_or(0) > seq_num {
+                            envelopes.push(envelope);
+                        }
+                    }
+                }
+            }
+        }
+
+        envelopes.sort_by_key(|e| e.sequence);
+        Ok(envelopes)
+    }
+}
+
+#[cfg(all(feature = "json-file", feature = "async"))]
+#[async_trait::async_trait]
+impl<A> crate::async_api::AsyncEventStore<A> for JsonFileEventStore<A>
+where
+    A: crate::aggregate::Aggregate + Send + Sync + 'static,
+    A::Event: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync,
+    A::Id: serde::Serialize + serde::de::DeserializeOwned + Clone + PartialEq + Send + Sync,
+{
+    type Error = crate::error::EventStoreError;
+
+    async fn load(
+        &self,
+        aggregate_id: &A::Id,
+    ) -> Result<crate::event_store::EventStream<A>, Self::Error> {
+        let this = self.clone();
+        let agg_id = aggregate_id.clone();
+        tokio::task::spawn_blocking(move || crate::event_store::EventStore::load(&this, &agg_id))
+            .await
+            .map_err(|e| crate::error::EventStoreError::Backend(e.to_string()))?
+    }
+
+    async fn append(
+        &self,
+        aggregate_id: &A::Id,
+        expected_revision: crate::event::ExpectedRevision,
+        events: Vec<crate::event::NewEvent<A::Event>>,
+    ) -> Result<crate::event_store::EventStream<A>, Self::Error> {
+        let this = self.clone();
+        let agg_id = aggregate_id.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::event_store::EventStore::append(&this, &agg_id, expected_revision, events)
+        })
+        .await
+        .map_err(|e| crate::error::EventStoreError::Backend(e.to_string()))?
+    }
+
+    async fn load_global_after(
+        &self,
+        sequence: Option<u64>,
+    ) -> Result<crate::event_store::EventStream<A>, Self::Error> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::event_store::EventStore::load_global_after(&this, sequence)
+        })
+        .await
+        .map_err(|e| crate::error::EventStoreError::Backend(e.to_string()))?
+    }
+}
+
+#[cfg(feature = "json-file")]
+#[derive(Clone, Debug)]
+/// A JSON file-backed checkpoint store.
+///
+/// > [!WARNING]
+/// > This adapter is intended for **single-process development and testing purposes only**.
+/// > It is not designed or certified for production use-cases where high concurrency,
+/// > multi-process access, or strict reliability guarantees are required.
+pub struct JsonFileCheckpointStore {
+    checkpoints_path: std::path::PathBuf,
+}
+
+#[cfg(feature = "json-file")]
+impl JsonFileCheckpointStore {
+    /// Creates a new JSON file-backed checkpoint store.
+    pub fn new(checkpoints_path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            checkpoints_path: checkpoints_path.into(),
+        }
+    }
+}
+
+#[cfg(feature = "json-file")]
+impl crate::projection::CheckpointStore for JsonFileCheckpointStore {
+    type Error = crate::error::EventStoreError;
+
+    fn load_checkpoint(&self, projection_name: &str) -> Result<Option<u64>, Self::Error> {
+        let lock = get_file_lock(&self.checkpoints_path);
+        let _guard = lock.lock().unwrap();
+
+        if !self.checkpoints_path.exists() {
+            return Ok(None);
+        }
+
+        let content = std::fs::read_to_string(&self.checkpoints_path)
+            .map_err(|e| crate::error::EventStoreError::Backend(e.to_string()))?;
+
+        let map: std::collections::HashMap<String, u64> = serde_json::from_str(&content)
+            .map_err(|e| crate::error::EventStoreError::Deserialization(e.to_string()))?;
+
+        Ok(map.get(projection_name).copied())
+    }
+
+    fn save_checkpoint(&self, projection_name: &str, sequence: u64) -> Result<(), Self::Error> {
+        let lock = get_file_lock(&self.checkpoints_path);
+        let _guard = lock.lock().unwrap();
+
+        if let Some(parent) = self.checkpoints_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let content = if self.checkpoints_path.exists() {
+            std::fs::read_to_string(&self.checkpoints_path)
+                .map_err(|e| crate::error::EventStoreError::Backend(e.to_string()))?
+        } else {
+            "{}".to_string()
+        };
+
+        let mut map: std::collections::HashMap<String, u64> = serde_json::from_str(&content)
+            .map_err(|e| crate::error::EventStoreError::Deserialization(e.to_string()))?;
+
+        map.insert(projection_name.to_string(), sequence);
+
+        let new_content = serde_json::to_string(&map)
+            .map_err(|e| crate::error::EventStoreError::Serialization(e.to_string()))?;
+        write_atomic(&self.checkpoints_path, &new_content)
+            .map_err(|e| crate::error::EventStoreError::Backend(e.to_string()))?;
+
+        Ok(())
+    }
+}
+
+#[cfg(all(feature = "json-file", feature = "async"))]
+#[async_trait::async_trait]
+impl crate::projection::AsyncCheckpointStore for JsonFileCheckpointStore {
+    type Error = crate::error::EventStoreError;
+
+    async fn load_checkpoint(&self, projection_name: &str) -> Result<Option<u64>, Self::Error> {
+        let this = self.clone();
+        let name = projection_name.to_owned();
+        tokio::task::spawn_blocking(move || {
+            crate::projection::CheckpointStore::load_checkpoint(&this, &name)
+        })
+        .await
+        .map_err(|e| crate::error::EventStoreError::Backend(e.to_string()))?
+    }
+
+    async fn save_checkpoint(
+        &self,
+        projection_name: &str,
+        sequence: u64,
+    ) -> Result<(), Self::Error> {
+        let this = self.clone();
+        let name = projection_name.to_owned();
+        tokio::task::spawn_blocking(move || {
+            crate::projection::CheckpointStore::save_checkpoint(&this, &name, sequence)
+        })
+        .await
+        .map_err(|e| crate::error::EventStoreError::Backend(e.to_string()))?
     }
 }

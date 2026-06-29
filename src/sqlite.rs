@@ -102,37 +102,21 @@ where
         self.upcasters.register(event_type, upcaster);
     }
 
-    /// Initializes the SQLite event table and indexes.
-    pub fn initialize_schema(&self) -> Result<(), EventStoreError> {
+    /// Migrates the SQLite schemas to the latest version.
+    pub fn migrate_schema(&self) -> Result<(), EventStoreError> {
+        let config = crate::schema::SqlSchemaConfig::new(crate::schema::SqlDialect::Sqlite)
+            .with_events_table(&self.table_name);
+        let migrator = crate::schema::SchemaMigrator::new(config);
         let connection = self
             .connection
             .lock()
             .map_err(|_| EventStoreError::Poisoned)?;
-        connection
-            .execute_batch(&format!(
-                r#"
-                CREATE TABLE IF NOT EXISTS {table} (
-                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_id TEXT NOT NULL UNIQUE,
-                    aggregate_id TEXT NOT NULL,
-                    aggregate_type TEXT NOT NULL,
-                    revision INTEGER NOT NULL,
-                    event_type TEXT NOT NULL,
-                    event_version INTEGER NOT NULL,
-                    payload TEXT NOT NULL,
-                    metadata TEXT NOT NULL,
-                    recorded_at_ms INTEGER NOT NULL,
-                    UNIQUE (aggregate_type, aggregate_id, revision)
-                );
+        migrator.run_sqlite(&connection)
+    }
 
-                CREATE INDEX IF NOT EXISTS {table}_stream_idx
-                    ON {table} (aggregate_type, aggregate_id, revision);
-                "#,
-                table = self.table_name
-            ))
-            .map_err(map_sqlite_error)?;
-
-        Ok(())
+    /// Initializes the SQLite event table and indexes.
+    pub fn initialize_schema(&self) -> Result<(), EventStoreError> {
+        self.migrate_schema()
     }
 
     fn current_revision_locked(
@@ -472,19 +456,14 @@ impl SqliteCheckpointStore {
 
     /// Initializes the checkpoint schema table.
     pub fn initialize_schema(&self) -> Result<(), EventStoreError> {
+        let config = crate::schema::SqlSchemaConfig::new(crate::schema::SqlDialect::Sqlite)
+            .with_checkpoints_table(&self.table_name);
+        let migrator = crate::schema::SchemaMigrator::new(config);
         let connection = self
             .connection
             .lock()
             .map_err(|_| EventStoreError::Poisoned)?;
-        let sql = format!(
-            "CREATE TABLE IF NOT EXISTS {} (
-                projection_name TEXT PRIMARY KEY,
-                sequence INTEGER NOT NULL
-            );",
-            self.table_name
-        );
-        connection.execute(&sql, []).map_err(map_sqlite_error)?;
-        Ok(())
+        migrator.run_sqlite(&connection)
     }
 }
 
@@ -630,21 +609,14 @@ where
 
     /// Initializes the idempotency schema table.
     pub fn initialize_schema(&self) -> Result<(), EventStoreError> {
+        let config = crate::schema::SqlSchemaConfig::new(crate::schema::SqlDialect::Sqlite)
+            .with_idempotency_table(&self.table_name);
+        let migrator = crate::schema::SchemaMigrator::new(config);
         let connection = self
             .connection
             .lock()
             .map_err(|_| EventStoreError::Poisoned)?;
-        let sql = format!(
-            "CREATE TABLE IF NOT EXISTS {} (
-                idempotency_key TEXT PRIMARY KEY,
-                state TEXT NOT NULL CHECK (state IN ('pending', 'complete')),
-                value TEXT,
-                updated_at_ms INTEGER NOT NULL
-            );",
-            self.table_name
-        );
-        connection.execute(&sql, []).map_err(map_sqlite_error)?;
-        Ok(())
+        migrator.run_sqlite(&connection)
     }
 }
 

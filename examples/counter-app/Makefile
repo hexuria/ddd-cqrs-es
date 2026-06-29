@@ -39,6 +39,9 @@ endif
 ifeq ($(db), redis)
   DATABASE_BACKEND = redis
 endif
+ifeq ($(db), mysql)
+  DATABASE_BACKEND = mysql
+endif
 
 ifeq ($(realtime), off)
   REALTIME_BACKEND = off
@@ -73,12 +76,19 @@ endif
 ifeq ($(DATABASE_BACKEND), redis)
   CARGO_FEATURES := ssr,redis
 endif
+ifeq ($(DATABASE_BACKEND), mysql)
+  CARGO_FEATURES := ssr,mysql
+endif
 
 SPIN_CARGO_FEATURES := $(CARGO_FEATURES)
 WASMTIME_CARGO_FEATURES := $(CARGO_FEATURES)
 ifneq (,$(filter redis,$(DATABASE_BACKEND) $(REALTIME_BACKEND)))
   SPIN_CARGO_FEATURES := $(CARGO_FEATURES),spin-redis
   WASMTIME_CARGO_FEATURES := $(CARGO_FEATURES),wasi-redis
+endif
+ifeq ($(DATABASE_BACKEND), mysql)
+  SPIN_CARGO_FEATURES := $(SPIN_CARGO_FEATURES),spin-mysql
+  WASMTIME_CARGO_FEATURES := $(WASMTIME_CARGO_FEATURES),wasi-mysql
 endif
 
 SPIN_MANIFEST := spin.toml
@@ -96,8 +106,10 @@ help:
 	@echo "Database Selection Options:"
 	@echo "  make wasmtime db=neon      - Run with Neon Postgres HTTP backend"
 	@echo "  make wasmtime db=turso     - Run with Turso LibSQL HTTP backend"
+	@echo "  make wasmtime db=mysql     - Run with raw TCP MySQL backend"
 	@echo "  make wasmtime db=redis realtime=redis - Run with Redis event store and SSE notifications"
 	@echo "  make spin db=postgres      - Run with Spin native Postgres backend"
+	@echo "  make spin db=mysql realtime=polling - Run with Spin native MySQL and SSE polling"
 	@echo "  make spin db=redis realtime=redis - Run with Spin Redis event store, SSE, and Redis trigger"
 	@echo "  make db=neon fresh         - Reset active database tables without starting the app"
 
@@ -109,6 +121,16 @@ db-reset:
 	@echo "Resetting database backend: $(DATABASE_BACKEND)..."
 	@DATABASE_URL_VALUE=""; \
 	DATABASE_AUTH_TOKEN_VALUE=""; \
+	if [ "$(DATABASE_BACKEND)" = "mysql" ]; then \
+		if [ -n "$$MYSQL_URL" ]; then \
+			DATABASE_URL_VALUE="$$MYSQL_URL"; \
+		elif [ -n "$$DATABASE_URL" ]; then \
+			DATABASE_URL_VALUE="$$DATABASE_URL"; \
+		else \
+			echo "Error: Neither DATABASE_URL nor MYSQL_URL is set for MySQL reset."; \
+			exit 1; \
+		fi; \
+	fi; \
 	case "$(DATABASE_BACKEND)" in \
 		postgres) DATABASE_URL_VALUE="$$POSTGRES_URL" ;; \
 		neon) DATABASE_URL_VALUE="$$NEON_DB_URL" ;; \
@@ -137,13 +159,18 @@ spin:
 	REDIS_URL_VALUE="$${REDIS_URL:-redis://127.0.0.1:6379}"; \
 	REDIS_CHANNEL_VALUE="$${REDIS_CHANNEL:-counter-events}"; \
 	SPIN_VARIABLE_FLAGS=""; \
-	case "$(DATABASE_BACKEND)" in \
-		postgres) DATABASE_URL_VALUE="$$POSTGRES_URL" ;; \
-		neon) DATABASE_URL_VALUE="$$NEON_DB_URL" ;; \
+		case "$(DATABASE_BACKEND)" in \
+			postgres) DATABASE_URL_VALUE="$$POSTGRES_URL" ;; \
+			mysql) DATABASE_URL_VALUE="$${MYSQL_URL:-$$DATABASE_URL}" ;; \
+			neon) DATABASE_URL_VALUE="$$NEON_DB_URL" ;; \
 		libsql|turso) DATABASE_URL_VALUE="$$TURSO_URL"; DATABASE_AUTH_TOKEN_VALUE="$$TURSO_AUTH_TOKEN" ;; \
 		supabase) DATABASE_URL_VALUE="$$SUPABASE_URL"; DATABASE_AUTH_TOKEN_VALUE="$$SUPABASE_SECRET_KEY" ;; \
 		redis) DATABASE_URL_VALUE="$$REDIS_URL_VALUE" ;; \
 	esac; \
+	if [ "$(DATABASE_BACKEND)" = "mysql" ] && [ -z "$$DATABASE_URL_VALUE" ]; then \
+		echo "Error: Neither DATABASE_URL nor MYSQL_URL is set for MySQL Spin."; \
+		exit 1; \
+	fi; \
 	if [ "$(REALTIME_BACKEND)" = "redis" ]; then \
 		SPIN_VARIABLE_FLAGS="--variable redis_url=$$REDIS_URL_VALUE --variable redis_channel=$$REDIS_CHANNEL_VALUE"; \
 	fi; \
@@ -164,11 +191,16 @@ wasmtime:
 	REDIS_CHANNEL_VALUE="$${REDIS_CHANNEL:-counter-events}"; \
 	case "$(DATABASE_BACKEND)" in \
 		postgres) DATABASE_URL_VALUE="$$POSTGRES_URL" ;; \
+		mysql) DATABASE_URL_VALUE="$${MYSQL_URL:-$$DATABASE_URL}" ;; \
 		neon) DATABASE_URL_VALUE="$$NEON_DB_URL" ;; \
 		libsql|turso) DATABASE_URL_VALUE="$$TURSO_URL"; DATABASE_AUTH_TOKEN_VALUE="$$TURSO_AUTH_TOKEN" ;; \
 		supabase) DATABASE_URL_VALUE="$$SUPABASE_URL"; DATABASE_AUTH_TOKEN_VALUE="$$SUPABASE_SECRET_KEY" ;; \
 		redis) DATABASE_URL_VALUE="$$REDIS_URL_VALUE" ;; \
 	esac; \
+	if [ "$(DATABASE_BACKEND)" = "mysql" ] && [ -z "$$DATABASE_URL_VALUE" ]; then \
+		echo "Error: Neither DATABASE_URL nor MYSQL_URL is set for MySQL Wasmtime."; \
+		exit 1; \
+	fi; \
 	wasmtime serve \
 		-W component-model-async=y \
 		-S p3=y \
