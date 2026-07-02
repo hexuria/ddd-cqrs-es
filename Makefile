@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := help
 SHELL := /bin/bash
 
-.PHONY: help version publish example clean
+.PHONY: help version publish example clean ci
 .PHONY: spin wasmtime run --dry-run dry-run
 
 # Convenience aliases used by examples/counter-app passthrough.
@@ -29,6 +29,7 @@ help:
 	@echo "  make publish dry-run"
 	@echo "  make example spin db=neon realtime=redis"
 	@echo "  make example-check                  # Compile counter-app counterexample with sqlite feature"
+	@echo "  make ci                             # Run full CI quality suite locally"
 
 version:
 	@bash scripts/version.sh $(VERSION_ARG)
@@ -50,6 +51,9 @@ example:
 
 example-check:
 	cargo check --manifest-path examples/$(EXAMPLE_CHECK_TARGET)/Cargo.toml --target wasm32-wasip2 --no-default-features --features $(EXAMPLE_CHECK_FEATURES)
+
+ci:
+	bash scripts/ci-check.sh
 
 # No-op placeholders so `make version X`, `make publish --dry-run`, and
 # `make example spin` don't fail on positional arguments.

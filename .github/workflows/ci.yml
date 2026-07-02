@@ -40,25 +40,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Ensure docs script is executable
-        run: chmod +x scripts/verify-docs-rust.sh scripts/verify-docs.sh
+        run: chmod +x scripts/verify-docs-rust.sh scripts/verify-docs.sh scripts/ci-check.sh
 
-      - name: Rustfmt check
-        run: cargo fmt --all -- --check
-
-      - name: Compile library crate
-        run: cargo check --all-targets -p ddd_cqrs_es
-
-      - name: Run unit and integration tests
-        run: cargo test --all-targets --all-features -p ddd_cqrs_es
-
-      - name: Run doc tests
-        run: cargo test --doc --all-features -p ddd_cqrs_es
-
-      - name: Docs hardening validation
-        run: bash scripts/verify-docs-rust.sh
-
-      - name: Install WASI target for example compile check
-        run: rustup target add wasm32-wasip2
-
-      - name: Compile counter-app example (sqlite backend)
-        run: make example-check
+      - name: Run CI quality suite
+        run: bash scripts/ci-check.sh
