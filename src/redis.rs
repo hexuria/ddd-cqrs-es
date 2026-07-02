@@ -837,7 +837,7 @@ where
 
         Ok(Self {
             event_id,
-            event_type: event.event_type,
+            event_type: event.event_type.into_string(),
             event_version: event.event_version,
             payload: event.payload,
             payload_json,
@@ -1389,10 +1389,6 @@ mod tests {
 
         fn aggregate_type() -> &'static str {
             "test_aggregate"
-        }
-
-        fn id(&self) -> Option<&Self::Id> {
-            None
         }
 
         fn revision(&self) -> u64 {

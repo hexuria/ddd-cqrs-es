@@ -1,6 +1,7 @@
 use crate::aggregate::Aggregate;
 use crate::event::EventEnvelope;
 use crate::event_store::EventStore;
+use std::fmt::{Display, Formatter};
 
 #[cfg(feature = "async")]
 use async_trait::async_trait;
@@ -87,7 +88,6 @@ pub trait Projection<E, Id> {
 /// #     type Event = UserEvent;
 /// #     type Error = ();
 /// #     fn aggregate_type() -> &'static str { "user" }
-/// #     fn id(&self) -> Option<&Self::Id> { None }
 /// #     fn revision(&self) -> u64 { 0 }
 /// #     fn new() -> Self { UserAggregate }
 /// #     fn apply(&mut self, _event: &Self::Event) {}
@@ -159,6 +159,15 @@ impl<P> InMemoryProjectionRunner<P> {
         S: EventStore<A>,
         P: Projection<A::Event, A::Id>,
     {
+        #[cfg(feature = "tracing")]
+        let _span = tracing::debug_span!(
+            "projection.run",
+            runner = "in_memory",
+            projection = self.projection.name(),
+            aggregate_type = A::aggregate_type()
+        )
+        .entered();
+
         let events = store
             .load_global_after(self.checkpoint)
             .map_err(ProjectionRunnerError::Store)?;
@@ -189,6 +198,38 @@ pub enum ProjectionRunnerError<
     Store(StoreError),
     /// Checkpoint storage failed.
     Checkpoint(CheckpointError),
+}
+
+impl<ProjectionError, StoreError, CheckpointError> Display
+    for ProjectionRunnerError<ProjectionError, StoreError, CheckpointError>
+where
+    ProjectionError: Display,
+    StoreError: Display,
+    CheckpointError: Display,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProjectionRunnerError::Projection(error) => Display::fmt(error, f),
+            ProjectionRunnerError::Store(error) => Display::fmt(error, f),
+            ProjectionRunnerError::Checkpoint(error) => Display::fmt(error, f),
+        }
+    }
+}
+
+impl<ProjectionError, StoreError, CheckpointError> std::error::Error
+    for ProjectionRunnerError<ProjectionError, StoreError, CheckpointError>
+where
+    ProjectionError: std::error::Error + 'static,
+    StoreError: std::error::Error + 'static,
+    CheckpointError: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ProjectionRunnerError::Projection(error) => Some(error),
+            ProjectionRunnerError::Store(error) => Some(error),
+            ProjectionRunnerError::Checkpoint(error) => Some(error),
+        }
+    }
 }
 
 /// A persistent store for tracking projection sequence checkpoints.
@@ -274,6 +315,15 @@ where
         P: Projection<A::Event, A::Id>,
     {
         let name = self.projection.name();
+        #[cfg(feature = "tracing")]
+        let _span = tracing::debug_span!(
+            "projection.run",
+            runner = "persisted",
+            projection = name,
+            aggregate_type = A::aggregate_type()
+        )
+        .entered();
+
         let checkpoint = self
             .checkpoint_store
             .load_checkpoint(name)
@@ -455,6 +505,15 @@ impl<P> CheckpointedProjectionRunner<P> {
         S: EventStore<A>,
         P: CheckpointedProjection<A::Event, A::Id>,
     {
+        #[cfg(feature = "tracing")]
+        let _span = tracing::debug_span!(
+            "projection.run",
+            runner = "checkpointed",
+            projection = self.projection.name(),
+            aggregate_type = A::aggregate_type()
+        )
+        .entered();
+
         let checkpoint = self
             .projection
             .load_checkpoint()
@@ -468,6 +527,101 @@ impl<P> CheckpointedProjectionRunner<P> {
         for event in events {
             self.projection
                 .apply_and_checkpoint(&event)
+                .map_err(ProjectionRunnerError::Projection)?;
+            applied += 1;
+        }
+
+        Ok(applied)
+    }
+}
+
+/// A projection that commits read-model updates and checkpoint movement in one transaction.
+///
+/// Implementations should use one backing-store transaction inside
+/// [`TransactionalCheckpointedProjection::apply_and_checkpoint_transactionally`].
+/// This trait is intentionally separate from [`Projection`] so production
+/// read models can expose their stronger consistency contract explicitly.
+pub trait TransactionalCheckpointedProjection<E, Id> {
+    /// Projection error.
+    type Error;
+
+    /// Stable projection name.
+    fn name(&self) -> &'static str;
+
+    /// Loads the last successfully processed event global sequence.
+    fn load_checkpoint(&self) -> Result<Option<u64>, Self::Error>;
+
+    /// Applies one event to the read model and saves the event checkpoint in
+    /// the same backing-store transaction.
+    fn apply_and_checkpoint_transactionally(
+        &mut self,
+        event: &EventEnvelope<E, Id>,
+    ) -> Result<(), Self::Error>;
+}
+
+/// Runner for projections that own a transaction-aware read-model/checkpoint update.
+#[derive(Debug)]
+pub struct TransactionalCheckpointedProjectionRunner<P> {
+    projection: P,
+}
+
+impl<P> TransactionalCheckpointedProjectionRunner<P> {
+    /// Creates a new transactional checkpointed projection runner.
+    pub fn new(projection: P) -> Self {
+        Self { projection }
+    }
+
+    /// Returns the wrapped projection.
+    pub fn projection(&self) -> &P {
+        &self.projection
+    }
+
+    /// Returns the wrapped projection mutably.
+    pub fn projection_mut(&mut self) -> &mut P {
+        &mut self.projection
+    }
+
+    /// Consumes the runner and returns the projection.
+    pub fn into_projection(self) -> P {
+        self.projection
+    }
+}
+
+impl<P> TransactionalCheckpointedProjectionRunner<P> {
+    /// Loads global events after the projection checkpoint and applies each
+    /// read-model update with its checkpoint in one projection-owned transaction.
+    #[allow(clippy::type_complexity)]
+    pub fn run<A, S>(
+        &mut self,
+        store: &S,
+    ) -> Result<usize, ProjectionRunnerError<P::Error, S::Error, P::Error>>
+    where
+        A: Aggregate,
+        S: EventStore<A>,
+        P: TransactionalCheckpointedProjection<A::Event, A::Id>,
+    {
+        #[cfg(feature = "tracing")]
+        let _span = tracing::debug_span!(
+            "projection.run",
+            runner = "transactional",
+            projection = self.projection.name(),
+            aggregate_type = A::aggregate_type()
+        )
+        .entered();
+
+        let checkpoint = self
+            .projection
+            .load_checkpoint()
+            .map_err(ProjectionRunnerError::Checkpoint)?;
+
+        let events = store
+            .load_global_after(checkpoint)
+            .map_err(ProjectionRunnerError::Store)?;
+        let mut applied = 0;
+
+        for event in events {
+            self.projection
+                .apply_and_checkpoint_transactionally(&event)
                 .map_err(ProjectionRunnerError::Projection)?;
             applied += 1;
         }
@@ -515,6 +669,94 @@ pub trait AsyncCheckpointedProjection<E, Id> {
 #[derive(Debug)]
 pub struct AsyncCheckpointedProjectionRunner<P> {
     projection: P,
+}
+
+/// Async projection that commits read-model updates and checkpoint movement in one transaction.
+#[cfg(feature = "async")]
+#[async_trait]
+pub trait AsyncTransactionalCheckpointedProjection<E, Id> {
+    /// Projection error.
+    type Error;
+
+    /// Stable projection name.
+    fn name(&self) -> &'static str;
+
+    /// Loads the last successfully processed event global sequence.
+    async fn load_checkpoint(&self) -> Result<Option<u64>, Self::Error>;
+
+    /// Applies one event to the read model and saves the event checkpoint in
+    /// the same backing-store transaction.
+    async fn apply_and_checkpoint_transactionally(
+        &mut self,
+        event: &EventEnvelope<E, Id>,
+    ) -> Result<(), Self::Error>;
+}
+
+/// Async runner for transaction-aware checkpointed projections.
+#[cfg(feature = "async")]
+#[derive(Debug)]
+pub struct AsyncTransactionalCheckpointedProjectionRunner<P> {
+    projection: P,
+}
+
+#[cfg(feature = "async")]
+impl<P> AsyncTransactionalCheckpointedProjectionRunner<P> {
+    /// Creates a new async transactional checkpointed projection runner.
+    pub fn new(projection: P) -> Self {
+        Self { projection }
+    }
+
+    /// Returns the wrapped projection.
+    pub fn projection(&self) -> &P {
+        &self.projection
+    }
+
+    /// Returns the wrapped projection mutably.
+    pub fn projection_mut(&mut self) -> &mut P {
+        &mut self.projection
+    }
+
+    /// Consumes the runner and returns the projection.
+    pub fn into_projection(self) -> P {
+        self.projection
+    }
+}
+
+#[cfg(feature = "async")]
+impl<P> AsyncTransactionalCheckpointedProjectionRunner<P> {
+    /// Loads global events after the projection checkpoint and applies each
+    /// read-model update with its checkpoint in one projection-owned transaction.
+    pub async fn run<A, S>(
+        &mut self,
+        store: &S,
+    ) -> Result<usize, ProjectionRunnerError<P::Error, S::Error, P::Error>>
+    where
+        A: Aggregate + Send + Sync,
+        S: crate::async_api::AsyncEventStore<A>,
+        P: AsyncTransactionalCheckpointedProjection<A::Event, A::Id> + Send + Sync,
+    {
+        let checkpoint = self
+            .projection
+            .load_checkpoint()
+            .await
+            .map_err(ProjectionRunnerError::Checkpoint)?;
+
+        let events = store
+            .load_global_after(checkpoint)
+            .await
+            .map_err(ProjectionRunnerError::Store)?;
+        let mut applied = 0;
+
+        for event in events {
+            self.projection
+                .apply_and_checkpoint_transactionally(&event)
+                .await
+                .map_err(ProjectionRunnerError::Projection)?;
+            applied += 1;
+        }
+
+        Ok(applied)
+    }
 }
 
 #[cfg(feature = "async")]

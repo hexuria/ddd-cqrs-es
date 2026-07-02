@@ -1,9 +1,12 @@
 use crate::aggregate::{Aggregate, LoadedAggregate};
 use crate::error::{EventStoreError, EventStoreFailure, RepositoryError};
-use crate::event::{ExpectedRevision, NewEvent};
-use crate::event_store::{EventStore, EventStream};
+use crate::event::{EventEnvelope, ExpectedRevision, NewEvent};
+use crate::event_store::{
+    AtomicIdempotentEventStore, EventStore, EventStream, IdempotentAppendError,
+};
 use crate::idempotency::{
-    IdempotencyKey, IdempotencyState, IdempotencyStore, IdempotentRepositoryError,
+    IdempotencyKey, IdempotencyState, IdempotencyStore, IdempotencyWaitConfig,
+    IdempotentRepositoryError,
 };
 use crate::metadata::Metadata;
 use crate::snapshot::{SnapshotRepositoryError, SnapshotStore};
@@ -39,6 +42,16 @@ pub type IdempotentRepositoryResult<A, S, I, T> = Result<
     >,
 >;
 
+/// Result type returned by atomic idempotent repository operations.
+pub type AtomicIdempotentRepositoryResult<A, S, T> = Result<
+    T,
+    IdempotentRepositoryError<
+        <A as Aggregate>::Error,
+        <S as EventStore<A>>::Error,
+        <S as EventStore<A>>::Error,
+    >,
+>;
+
 /// Coordinates aggregate loading, command execution, and event appending.
 ///
 /// # Example
@@ -59,7 +72,6 @@ pub type IdempotentRepositoryResult<A, S, I, T> = Result<
 /// #     type Event = CounterEvent;
 /// #     type Error = ();
 /// #     fn aggregate_type() -> &'static str { "counter" }
-/// #     fn id(&self) -> Option<&Self::Id> { None }
 /// #     fn revision(&self) -> u64 { self.revision }
 /// #     fn new() -> Self { CounterAggregate { revision: 0 } }
 /// #     fn apply(&mut self, _event: &Self::Event) { self.revision += 1; }
@@ -107,6 +119,10 @@ where
 
     /// Loads and replays one aggregate stream.
     pub fn load(&self, aggregate_id: &A::Id) -> RepositoryResult<A, S, LoadedAggregate<A>> {
+        #[cfg(feature = "tracing")]
+        let _span =
+            tracing::debug_span!("aggregate.load", aggregate_type = A::aggregate_type()).entered();
+
         let events = self
             .store
             .load(aggregate_id)
@@ -122,6 +138,15 @@ where
         events: Vec<A::Event>,
         metadata: Metadata,
     ) -> RepositoryResult<A, S, CommittedEvents<A>> {
+        #[cfg(feature = "tracing")]
+        let _span = tracing::debug_span!(
+            "event_store.append",
+            aggregate_type = A::aggregate_type(),
+            expected_revision = loaded.revision,
+            event_count = events.len()
+        )
+        .entered();
+
         let events = events
             .into_iter()
             .map(|event| NewEvent::new(event, metadata.clone()))
@@ -159,6 +184,11 @@ where
         command: A::Command,
         metadata: Metadata,
     ) -> RepositoryResult<A, S, CommittedEvents<A>> {
+        #[cfg(feature = "tracing")]
+        let _span =
+            tracing::debug_span!("repository.execute", aggregate_type = A::aggregate_type())
+                .entered();
+
         let loaded = self.load(aggregate_id)?;
         let events = loaded
             .state
@@ -187,9 +217,33 @@ where
         command: A::Command,
         metadata: Metadata,
     ) -> RepositoryResult<A, S, ExecutionOutcome<A>> {
-        let committed = self.execute(aggregate_id, command, metadata)?;
+        #[cfg(feature = "tracing")]
+        let _span = tracing::debug_span!(
+            "repository.execute_returning_state",
+            aggregate_type = A::aggregate_type()
+        )
+        .entered();
+
         let loaded = self.load(aggregate_id)?;
-        Ok((loaded, committed))
+        let events = loaded
+            .state
+            .handle(command)
+            .map_err(RepositoryError::Domain)?;
+        #[cfg(feature = "tracing")]
+        let event_count = events.len();
+
+        let committed = self.save(aggregate_id, &loaded, events, metadata)?;
+        let updated = apply_committed_events(loaded, &committed);
+
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            aggregate_type = A::aggregate_type(),
+            expected_revision = updated.revision.saturating_sub(event_count as u64),
+            event_count,
+            "committed aggregate events and rebuilt state"
+        );
+
+        Ok((updated, committed))
     }
 
     /// Loads an aggregate using the latest snapshot, then replays events after
@@ -202,6 +256,13 @@ where
     where
         SS: SnapshotStore<A>,
     {
+        #[cfg(feature = "tracing")]
+        let _span = tracing::debug_span!(
+            "snapshot.load_with_replay",
+            aggregate_type = A::aggregate_type()
+        )
+        .entered();
+
         let snapshot = snapshots
             .load_snapshot(aggregate_id)
             .map_err(SnapshotRepositoryError::Snapshot)?;
@@ -283,6 +344,31 @@ where
     where
         I: IdempotencyStore<CommittedEvents<A>>,
     {
+        self.execute_idempotent_with_wait_config(
+            aggregate_id,
+            command,
+            metadata,
+            idempotency_key,
+            idempotency_store,
+            IdempotencyWaitConfig::default(),
+        )
+    }
+
+    /// Executes a command once for an idempotency key using explicit pending-key wait limits.
+    pub fn execute_idempotent_with_wait_config<I>(
+        &self,
+        aggregate_id: &A::Id,
+        command: A::Command,
+        metadata: Metadata,
+        idempotency_key: IdempotencyKey,
+        idempotency_store: &I,
+        wait_config: IdempotencyWaitConfig,
+    ) -> IdempotentRepositoryResult<A, S, I, CommittedEvents<A>>
+    where
+        I: IdempotencyStore<CommittedEvents<A>>,
+    {
+        let started = std::time::Instant::now();
+
         loop {
             match idempotency_store
                 .load(&idempotency_key)
@@ -292,7 +378,13 @@ where
                     return Ok(committed);
                 }
                 Some(IdempotencyState::Pending) => {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    let Some(delay) = wait_config.next_delay(started.elapsed()) else {
+                        return Err(IdempotentRepositoryError::IdempotencyPendingTimeout {
+                            key: idempotency_key,
+                            waited: started.elapsed(),
+                        });
+                    };
+                    std::thread::sleep(delay);
                     continue;
                 }
                 None => {
@@ -302,6 +394,13 @@ where
                     {
                         break;
                     }
+                    let Some(delay) = wait_config.next_delay(started.elapsed()) else {
+                        return Err(IdempotentRepositoryError::IdempotencyPendingTimeout {
+                            key: idempotency_key,
+                            waited: started.elapsed(),
+                        });
+                    };
+                    std::thread::sleep(delay);
                 }
             }
         }
@@ -346,6 +445,109 @@ where
 
         Ok(committed)
     }
+
+    /// Executes a command once using an event-store-native transaction-aware
+    /// idempotency record.
+    ///
+    /// Unlike [`Self::execute_idempotent`], this path requires the event store
+    /// to reserve the idempotency key, append events, and save the completed
+    /// result in one backing-store transaction. Use this for SQL-backed
+    /// production workflows that require crash-atomic retry recovery.
+    pub fn execute_idempotent_atomic(
+        &self,
+        aggregate_id: &A::Id,
+        command: A::Command,
+        metadata: Metadata,
+        idempotency_key: IdempotencyKey,
+    ) -> AtomicIdempotentRepositoryResult<A, S, CommittedEvents<A>>
+    where
+        S: AtomicIdempotentEventStore<A>,
+        A::Event: Clone,
+    {
+        self.execute_idempotent_atomic_with_wait_config(
+            aggregate_id,
+            command,
+            metadata,
+            idempotency_key,
+            IdempotencyWaitConfig::default(),
+        )
+    }
+
+    /// Executes a command once using a transaction-aware idempotency record and
+    /// explicit pending-key wait limits.
+    pub fn execute_idempotent_atomic_with_wait_config(
+        &self,
+        aggregate_id: &A::Id,
+        command: A::Command,
+        metadata: Metadata,
+        idempotency_key: IdempotencyKey,
+        wait_config: IdempotencyWaitConfig,
+    ) -> AtomicIdempotentRepositoryResult<A, S, CommittedEvents<A>>
+    where
+        S: AtomicIdempotentEventStore<A>,
+        A::Event: Clone,
+    {
+        #[cfg(feature = "tracing")]
+        let _span = tracing::debug_span!(
+            "repository.execute_idempotent_atomic",
+            aggregate_type = A::aggregate_type()
+        )
+        .entered();
+
+        let loaded = self.load(aggregate_id).map_err(|error| match error {
+            RepositoryError::Domain(error) => IdempotentRepositoryError::Domain(error),
+            RepositoryError::Concurrency(error) => IdempotentRepositoryError::Concurrency(error),
+            RepositoryError::Store(error) => IdempotentRepositoryError::Store(error),
+        })?;
+        let events = loaded
+            .state
+            .handle(command)
+            .map_err(IdempotentRepositoryError::Domain)?;
+        let events = events
+            .into_iter()
+            .map(|event| NewEvent::new(event, metadata.clone()))
+            .collect::<Vec<_>>();
+        let expected_revision = ExpectedRevision::Exact(loaded.revision);
+        let started = std::time::Instant::now();
+
+        loop {
+            match self.store.append_idempotent(
+                idempotency_key.clone(),
+                aggregate_id,
+                expected_revision,
+                events.clone(),
+            ) {
+                Ok(committed) => return Ok(committed),
+                Err(IdempotentAppendError::Pending { .. }) => {
+                    let Some(delay) = wait_config.next_delay(started.elapsed()) else {
+                        return Err(IdempotentRepositoryError::IdempotencyPendingTimeout {
+                            key: idempotency_key,
+                            waited: started.elapsed(),
+                        });
+                    };
+                    std::thread::sleep(delay);
+                }
+                Err(IdempotentAppendError::Store(error)) => {
+                    return Err(IdempotentRepositoryError::from_store_error(error));
+                }
+            }
+        }
+    }
+}
+
+fn apply_committed_events<A>(
+    mut loaded: LoadedAggregate<A>,
+    committed: &[EventEnvelope<A::Event, A::Id>],
+) -> LoadedAggregate<A>
+where
+    A: Aggregate,
+{
+    for envelope in committed {
+        loaded.state.apply(&envelope.payload);
+        loaded.revision = envelope.revision;
+    }
+
+    loaded
 }
 
 impl<A, S> Repository<A, S>

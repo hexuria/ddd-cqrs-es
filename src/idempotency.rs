@@ -3,6 +3,57 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+/// Default time to wait for an idempotency key that is already pending.
+pub const DEFAULT_IDEMPOTENCY_PENDING_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default polling interval while waiting for a pending idempotency key to complete.
+pub const DEFAULT_IDEMPOTENCY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Wait policy used when an idempotency key is already pending.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IdempotencyWaitConfig {
+    /// Maximum time to wait for a pending key before returning a timeout error.
+    pub pending_timeout: Duration,
+    /// Polling interval while waiting for another caller to complete the key.
+    pub poll_interval: Duration,
+}
+
+impl IdempotencyWaitConfig {
+    /// Creates an idempotency wait policy.
+    pub fn new(pending_timeout: Duration, poll_interval: Duration) -> Self {
+        Self {
+            pending_timeout,
+            poll_interval,
+        }
+    }
+
+    /// Returns the next delay, capped by the remaining timeout.
+    pub(crate) fn next_delay(&self, elapsed: Duration) -> Option<Duration> {
+        let remaining = self.pending_timeout.checked_sub(elapsed)?;
+        if remaining.is_zero() {
+            return None;
+        }
+
+        let poll_interval = if self.poll_interval.is_zero() {
+            Duration::from_millis(1)
+        } else {
+            self.poll_interval
+        };
+
+        Some(remaining.min(poll_interval))
+    }
+}
+
+impl Default for IdempotencyWaitConfig {
+    fn default() -> Self {
+        Self {
+            pending_timeout: DEFAULT_IDEMPOTENCY_PENDING_TIMEOUT,
+            poll_interval: DEFAULT_IDEMPOTENCY_POLL_INTERVAL,
+        }
+    }
+}
 
 /// Stable idempotency key used to deduplicate command retries.
 ///
@@ -200,6 +251,13 @@ pub enum IdempotentRepositoryError<DomainError, StoreError, IdempotencyError> {
     Store(StoreError),
     /// Idempotency store operation failed.
     Idempotency(IdempotencyError),
+    /// The idempotency key remained pending until the configured wait timeout elapsed.
+    IdempotencyPendingTimeout {
+        /// Key that was still pending.
+        key: IdempotencyKey,
+        /// Time spent waiting for the pending key.
+        waited: Duration,
+    },
 }
 
 impl<DomainError, StoreError, IdempotencyError>
@@ -230,6 +288,13 @@ where
             IdempotentRepositoryError::Concurrency(error) => Display::fmt(error, f),
             IdempotentRepositoryError::Store(error) => Display::fmt(error, f),
             IdempotentRepositoryError::Idempotency(error) => Display::fmt(error, f),
+            IdempotentRepositoryError::IdempotencyPendingTimeout { key, waited } => {
+                write!(
+                    f,
+                    "idempotency key `{key}` remained pending after {} ms",
+                    waited.as_millis()
+                )
+            }
         }
     }
 }
@@ -247,6 +312,7 @@ where
             IdempotentRepositoryError::Concurrency(error) => Some(error),
             IdempotentRepositoryError::Store(error) => Some(error),
             IdempotentRepositoryError::Idempotency(error) => Some(error),
+            IdempotentRepositoryError::IdempotencyPendingTimeout { .. } => None,
         }
     }
 }

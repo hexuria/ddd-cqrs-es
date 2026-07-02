@@ -1,9 +1,50 @@
 use crate::aggregate::Aggregate;
 use crate::error::EventStoreError;
 use crate::event::{EventEnvelope, ExpectedRevision, NewEvent};
+use crate::idempotency::IdempotencyKey;
+use std::error::Error;
+use std::fmt::{Display, Formatter};
 
 /// Committed events for one aggregate type.
 pub type EventStream<A> = Vec<EventEnvelope<<A as Aggregate>::Event, <A as Aggregate>::Id>>;
+
+/// Error returned by transaction-aware idempotent append operations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IdempotentAppendError<StoreError> {
+    /// Another executor has reserved the key and has not completed yet.
+    Pending {
+        /// Key that is still pending.
+        key: IdempotencyKey,
+    },
+    /// The backing event store failed.
+    Store(StoreError),
+}
+
+impl<StoreError> Display for IdempotentAppendError<StoreError>
+where
+    StoreError: Display,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IdempotentAppendError::Pending { key } => {
+                write!(f, "idempotency key `{key}` is pending")
+            }
+            IdempotentAppendError::Store(error) => Display::fmt(error, f),
+        }
+    }
+}
+
+impl<StoreError> Error for IdempotentAppendError<StoreError>
+where
+    StoreError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            IdempotentAppendError::Pending { .. } => None,
+            IdempotentAppendError::Store(error) => Some(error),
+        }
+    }
+}
 
 /// Event persistence abstraction for one aggregate type.
 ///
@@ -29,7 +70,6 @@ pub type EventStream<A> = Vec<EventEnvelope<<A as Aggregate>::Event, <A as Aggre
 /// #     type Event = MyEvent;
 /// #     type Error = ();
 /// #     fn aggregate_type() -> &'static str { "my_aggregate" }
-/// #     fn id(&self) -> Option<&Self::Id> { None }
 /// #     fn revision(&self) -> u64 { 0 }
 /// #     fn new() -> Self { MyAggregate }
 /// #     fn apply(&mut self, _event: &Self::Event) {}
@@ -77,6 +117,28 @@ where
 
     /// Loads globally ordered events after a global sequence number.
     fn load_global_after(&self, sequence: Option<u64>) -> Result<EventStream<A>, Self::Error>;
+}
+
+/// Event store extension for crash-atomic idempotent appends.
+///
+/// Implementations must reserve the idempotency key, append events, and persist
+/// the completed committed event stream in one backing-store transaction. A
+/// retry with a completed key returns the originally committed events without
+/// appending again. A pending key returns [`IdempotentAppendError::Pending`] so
+/// repositories can apply a bounded wait policy.
+pub trait AtomicIdempotentEventStore<A>: EventStore<A>
+where
+    A: Aggregate,
+{
+    /// Appends events once for the idempotency key, atomically with the
+    /// idempotency completion record.
+    fn append_idempotent(
+        &self,
+        idempotency_key: IdempotencyKey,
+        aggregate_id: &A::Id,
+        expected_revision: ExpectedRevision,
+        events: Vec<NewEvent<A::Event>>,
+    ) -> Result<EventStream<A>, IdempotentAppendError<Self::Error>>;
 }
 
 /// Convenience alias for stores that use the framework's standard error type.

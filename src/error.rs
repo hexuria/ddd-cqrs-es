@@ -1,6 +1,7 @@
 use crate::event::{ExpectedRevision, Revision};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 
 /// Optimistic concurrency failure.
 ///
@@ -60,24 +61,168 @@ impl Error for ConcurrencyError {}
 /// let error = EventStoreError::Concurrency(ConcurrencyError::StreamAlreadyExists);
 /// assert!(error.source().is_some());
 /// ```
+/// Stored source error used when a backend-specific error type cannot be part
+/// of the public enum without leaking adapter implementation details.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventStoreErrorSource {
+    message: String,
+}
+
+impl EventStoreErrorSource {
+    /// Creates a stored source error from an adapter error message.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl Display for EventStoreErrorSource {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Error for EventStoreErrorSource {}
+
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Debug)]
 pub enum EventStoreError {
     /// Optimistic concurrency check failed.
     Concurrency(ConcurrencyError),
     /// Event serialization failed.
     Serialization(String),
+    /// Event serialization failed with a preserved source error.
+    SerializationWithSource {
+        /// Public error message.
+        message: String,
+        /// Source error for error-chain aware callers.
+        #[cfg_attr(feature = "serde", serde(skip))]
+        source: Option<Arc<EventStoreErrorSource>>,
+    },
     /// Event deserialization failed.
     Deserialization(String),
+    /// Event deserialization failed with a preserved source error.
+    DeserializationWithSource {
+        /// Public error message.
+        message: String,
+        /// Source error for error-chain aware callers.
+        #[cfg_attr(feature = "serde", serde(skip))]
+        source: Option<Arc<EventStoreErrorSource>>,
+    },
     /// Backend connection or availability failure.
     Connection(String),
+    /// Backend connection or availability failure with a preserved source error.
+    ConnectionWithSource {
+        /// Public error message.
+        message: String,
+        /// Source error for error-chain aware callers.
+        #[cfg_attr(feature = "serde", serde(skip))]
+        source: Option<Arc<EventStoreErrorSource>>,
+    },
     /// Shared state was poisoned by a panic while holding a lock.
     Poisoned,
     /// Adapter-specific failure.
     Backend(String),
+    /// Adapter-specific failure with a preserved source error.
+    BackendWithSource {
+        /// Public error message.
+        message: String,
+        /// Source error for error-chain aware callers.
+        #[cfg_attr(feature = "serde", serde(skip))]
+        source: Option<Arc<EventStoreErrorSource>>,
+    },
     /// Unknown adapter failure.
     Unknown(String),
+    /// Unknown adapter failure with a preserved source error.
+    UnknownWithSource {
+        /// Public error message.
+        message: String,
+        /// Source error for error-chain aware callers.
+        #[cfg_attr(feature = "serde", serde(skip))]
+        source: Option<Arc<EventStoreErrorSource>>,
+    },
 }
+
+impl EventStoreError {
+    /// Creates a serialization error that preserves source context.
+    pub fn serialization_with_source(message: impl Into<String>, source: impl Display) -> Self {
+        Self::SerializationWithSource {
+            message: message.into(),
+            source: Some(Arc::new(EventStoreErrorSource::new(source.to_string()))),
+        }
+    }
+
+    /// Creates a deserialization error that preserves source context.
+    pub fn deserialization_with_source(message: impl Into<String>, source: impl Display) -> Self {
+        Self::DeserializationWithSource {
+            message: message.into(),
+            source: Some(Arc::new(EventStoreErrorSource::new(source.to_string()))),
+        }
+    }
+
+    /// Creates a connection error that preserves source context.
+    pub fn connection_with_source(message: impl Into<String>, source: impl Display) -> Self {
+        Self::ConnectionWithSource {
+            message: message.into(),
+            source: Some(Arc::new(EventStoreErrorSource::new(source.to_string()))),
+        }
+    }
+
+    /// Creates a backend error that preserves source context.
+    pub fn backend_with_source(message: impl Into<String>, source: impl Display) -> Self {
+        Self::BackendWithSource {
+            message: message.into(),
+            source: Some(Arc::new(EventStoreErrorSource::new(source.to_string()))),
+        }
+    }
+
+    /// Creates an unknown error that preserves source context.
+    pub fn unknown_with_source(message: impl Into<String>, source: impl Display) -> Self {
+        Self::UnknownWithSource {
+            message: message.into(),
+            source: Some(Arc::new(EventStoreErrorSource::new(source.to_string()))),
+        }
+    }
+}
+
+impl PartialEq for EventStoreError {
+    fn eq(&self, other: &Self) -> bool {
+        use EventStoreError::*;
+
+        match (self, other) {
+            (Concurrency(left), Concurrency(right)) => left == right,
+            (Serialization(left), Serialization(right)) => left == right,
+            (
+                SerializationWithSource { message: left, .. },
+                SerializationWithSource { message: right, .. },
+            ) => left == right,
+            (Deserialization(left), Deserialization(right)) => left == right,
+            (
+                DeserializationWithSource { message: left, .. },
+                DeserializationWithSource { message: right, .. },
+            ) => left == right,
+            (Connection(left), Connection(right)) => left == right,
+            (
+                ConnectionWithSource { message: left, .. },
+                ConnectionWithSource { message: right, .. },
+            ) => left == right,
+            (Poisoned, Poisoned) => true,
+            (Backend(left), Backend(right)) => left == right,
+            (BackendWithSource { message: left, .. }, BackendWithSource { message: right, .. }) => {
+                left == right
+            }
+            (Unknown(left), Unknown(right)) => left == right,
+            (UnknownWithSource { message: left, .. }, UnknownWithSource { message: right, .. }) => {
+                left == right
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for EventStoreError {}
 
 /// Classifies store errors for repository-level error mapping.
 ///
@@ -105,13 +250,28 @@ impl Display for EventStoreError {
         match self {
             EventStoreError::Concurrency(error) => Display::fmt(error, f),
             EventStoreError::Serialization(message) => write!(f, "serialization error: {message}"),
+            EventStoreError::SerializationWithSource { message, .. } => {
+                write!(f, "serialization error: {message}")
+            }
             EventStoreError::Deserialization(message) => {
                 write!(f, "deserialization error: {message}")
             }
+            EventStoreError::DeserializationWithSource { message, .. } => {
+                write!(f, "deserialization error: {message}")
+            }
             EventStoreError::Connection(message) => write!(f, "connection error: {message}"),
+            EventStoreError::ConnectionWithSource { message, .. } => {
+                write!(f, "connection error: {message}")
+            }
             EventStoreError::Poisoned => f.write_str("event store lock was poisoned"),
             EventStoreError::Backend(message) => write!(f, "event store backend error: {message}"),
+            EventStoreError::BackendWithSource { message, .. } => {
+                write!(f, "event store backend error: {message}")
+            }
             EventStoreError::Unknown(message) => write!(f, "unknown event store error: {message}"),
+            EventStoreError::UnknownWithSource { message, .. } => {
+                write!(f, "unknown event store error: {message}")
+            }
         }
     }
 }
@@ -120,6 +280,13 @@ impl Error for EventStoreError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             EventStoreError::Concurrency(error) => Some(error),
+            EventStoreError::SerializationWithSource { source, .. }
+            | EventStoreError::DeserializationWithSource { source, .. }
+            | EventStoreError::ConnectionWithSource { source, .. }
+            | EventStoreError::BackendWithSource { source, .. }
+            | EventStoreError::UnknownWithSource { source, .. } => source
+                .as_deref()
+                .map(|source| source as &(dyn Error + 'static)),
             _ => None,
         }
     }

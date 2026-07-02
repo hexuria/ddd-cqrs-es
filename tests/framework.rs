@@ -1,14 +1,16 @@
 use ddd_cqrs_es::{
     assert_event_store_contract, Aggregate, AggregateFixture, ConcurrencyError, DomainEvent,
-    EventStore, EventStoreError, ExpectedRevision, IdempotencyKey, IdempotencyState,
-    IdempotencyStore, InMemoryEventStore, InMemoryIdempotencyStore, InMemoryProjectionRunner,
-    InMemorySnapshotStore, Metadata, NewEvent, Projection, Repository, RepositoryError, Snapshot,
-    SnapshotStore,
+    EventStore, EventStoreContractOptions, EventStoreError, EventStream, EventType,
+    ExpectedRevision, IdempotencyKey, IdempotencyState, IdempotencyStore, IdempotencyWaitConfig,
+    InMemoryEventStore, InMemoryIdempotencyStore, InMemoryProjectionRunner, InMemorySnapshotStore,
+    Metadata, NewEvent, Projection, Repository, RepositoryError, Snapshot, SnapshotStore,
 };
 use std::collections::HashMap;
+use std::error::Error;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,6 +97,7 @@ where
     );
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Counter {
     id: Option<String>,
@@ -117,10 +120,6 @@ impl Aggregate for Counter {
 
     fn aggregate_type() -> &'static str {
         "counter"
-    }
-
-    fn id(&self) -> Option<&Self::Id> {
-        self.id.as_ref()
     }
 
     fn revision(&self) -> u64 {
@@ -165,6 +164,129 @@ impl Aggregate for Counter {
     }
 }
 
+#[derive(Clone, Debug)]
+struct LoadCountingStore {
+    inner: InMemoryEventStore<Counter>,
+    load_count: Arc<AtomicUsize>,
+}
+
+impl LoadCountingStore {
+    fn new(inner: InMemoryEventStore<Counter>) -> Self {
+        Self {
+            inner,
+            load_count: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn load_count(&self) -> usize {
+        self.load_count.load(Ordering::SeqCst)
+    }
+}
+
+impl EventStore<Counter> for LoadCountingStore {
+    type Error = EventStoreError;
+
+    fn load(&self, aggregate_id: &String) -> Result<EventStream<Counter>, Self::Error> {
+        self.load_count.fetch_add(1, Ordering::SeqCst);
+        self.inner.load(aggregate_id)
+    }
+
+    fn append(
+        &self,
+        aggregate_id: &String,
+        expected_revision: ExpectedRevision,
+        events: Vec<NewEvent<CounterEvent>>,
+    ) -> Result<EventStream<Counter>, Self::Error> {
+        self.inner.append(aggregate_id, expected_revision, events)
+    }
+
+    fn load_global_after(
+        &self,
+        sequence: Option<u64>,
+    ) -> Result<EventStream<Counter>, Self::Error> {
+        self.inner.load_global_after(sequence)
+    }
+}
+
+#[cfg(feature = "async")]
+#[async_trait::async_trait]
+impl ddd_cqrs_es::async_api::AsyncEventStore<Counter> for LoadCountingStore {
+    type Error = EventStoreError;
+
+    async fn load(&self, aggregate_id: &String) -> Result<EventStream<Counter>, Self::Error> {
+        EventStore::load(self, aggregate_id)
+    }
+
+    async fn append(
+        &self,
+        aggregate_id: &String,
+        expected_revision: ExpectedRevision,
+        events: Vec<NewEvent<CounterEvent>>,
+    ) -> Result<EventStream<Counter>, Self::Error> {
+        EventStore::append(self, aggregate_id, expected_revision, events)
+    }
+
+    async fn load_global_after(
+        &self,
+        sequence: Option<u64>,
+    ) -> Result<EventStream<Counter>, Self::Error> {
+        EventStore::load_global_after(self, sequence)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct OffsetSequenceStore {
+    inner: InMemoryEventStore<Counter>,
+    offset: u64,
+}
+
+impl OffsetSequenceStore {
+    fn new(offset: u64) -> Self {
+        Self {
+            inner: InMemoryEventStore::new(),
+            offset,
+        }
+    }
+
+    fn map_sequences(&self, mut events: EventStream<Counter>) -> EventStream<Counter> {
+        for event in &mut events {
+            event.sequence = event.sequence.map(|sequence| sequence + self.offset);
+        }
+        events
+    }
+}
+
+impl EventStore<Counter> for OffsetSequenceStore {
+    type Error = EventStoreError;
+
+    fn load(&self, aggregate_id: &String) -> Result<EventStream<Counter>, Self::Error> {
+        self.inner
+            .load(aggregate_id)
+            .map(|events| self.map_sequences(events))
+    }
+
+    fn append(
+        &self,
+        aggregate_id: &String,
+        expected_revision: ExpectedRevision,
+        events: Vec<NewEvent<CounterEvent>>,
+    ) -> Result<EventStream<Counter>, Self::Error> {
+        self.inner
+            .append(aggregate_id, expected_revision, events)
+            .map(|events| self.map_sequences(events))
+    }
+
+    fn load_global_after(
+        &self,
+        sequence: Option<u64>,
+    ) -> Result<EventStream<Counter>, Self::Error> {
+        let inner_sequence = sequence.map(|sequence| sequence.saturating_sub(self.offset));
+        self.inner
+            .load_global_after(inner_sequence)
+            .map(|events| self.map_sequences(events))
+    }
+}
+
 #[test]
 fn repository_executes_commands_and_replays_state() {
     let store = InMemoryEventStore::<Counter>::new();
@@ -190,6 +312,23 @@ fn repository_executes_commands_and_replays_state() {
     assert_eq!(loaded.state.value, 5);
     assert_eq!(loaded.revision, 3);
     assert_eq!(loaded.state.revision(), 3);
+}
+
+#[test]
+fn repository_execute_returning_state_loads_stream_once() {
+    let store = LoadCountingStore::new(InMemoryEventStore::<Counter>::new());
+    let observed_store = store.clone();
+    let repo = Repository::new(store);
+    let counter_id = "counter-load-once".to_owned();
+
+    let (loaded, committed) = repo
+        .execute_returning_state(&counter_id, CounterCommand::Create, Metadata::default())
+        .unwrap();
+
+    assert_eq!(observed_store.load_count(), 1);
+    assert_eq!(committed.len(), 1);
+    assert_eq!(loaded.revision, 1);
+    assert!(loaded.state.id.is_some());
 }
 
 #[test]
@@ -229,7 +368,38 @@ fn in_memory_store_passes_reusable_contract() {
         "contract-counter".to_owned(),
         CounterEvent::Created,
         CounterEvent::Incremented { by: 1 },
+        EventStoreContractOptions::default(),
     );
+}
+
+#[test]
+fn event_store_contract_accepts_custom_first_sequence() {
+    assert_event_store_contract::<Counter, _>(
+        OffsetSequenceStore::new(100),
+        "offset-contract-counter".to_owned(),
+        CounterEvent::Created,
+        CounterEvent::Incremented { by: 1 },
+        EventStoreContractOptions::with_expected_first_global_sequence(101),
+    );
+}
+
+#[test]
+fn event_type_is_a_string_newtype() {
+    let event_type = EventType::from("counter_created");
+
+    assert_eq!(event_type.as_str(), "counter_created");
+    assert_eq!(event_type.to_string(), "counter_created");
+    assert_eq!(event_type.clone().into_string(), "counter_created");
+}
+
+#[cfg(feature = "json")]
+#[test]
+fn event_type_round_trips_through_serde() {
+    let event_type = EventType::from("counter_created");
+    let json = serde_json::to_string(&event_type).unwrap();
+    let restored: EventType = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(restored, event_type);
 }
 
 #[cfg(feature = "sqlite")]
@@ -240,6 +410,7 @@ fn sqlite_store_passes_reusable_contract() {
         "sqlite-contract-counter".to_owned(),
         CounterEvent::Created,
         CounterEvent::Incremented { by: 1 },
+        EventStoreContractOptions::default(),
     );
 }
 
@@ -249,6 +420,114 @@ fn sqlite_idempotency_store_passes_contract() {
     let connection = rusqlite::Connection::open_in_memory().unwrap();
     let store = ddd_cqrs_es::SqliteIdempotencyStore::new(connection).unwrap();
     assert_sql_idempotency_store_contract(store);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_atomic_idempotent_retry_returns_original_committed_events() {
+    let store = ddd_cqrs_es::SqliteEventStore::<Counter>::in_memory().unwrap();
+    let repo = Repository::new(store.clone());
+    let counter_id = "sqlite-atomic-counter".to_owned();
+    let key = IdempotencyKey::new("sqlite-atomic-request");
+
+    let first = repo
+        .execute_idempotent_atomic(
+            &counter_id,
+            CounterCommand::Create,
+            Metadata::default(),
+            key.clone(),
+        )
+        .unwrap();
+    let retry = repo
+        .execute_idempotent_atomic(
+            &counter_id,
+            CounterCommand::Increment { by: 9 },
+            Metadata::default(),
+            key,
+        )
+        .unwrap();
+
+    assert_eq!(first, retry);
+    assert_eq!(first[0].payload, CounterEvent::Created);
+    assert_eq!(store.load(&counter_id).unwrap().len(), 1);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_atomic_idempotent_pending_key_times_out() {
+    let database_name = format!(
+        "file:sqlite_atomic_pending_{}_{}?mode=memory&cache=shared",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let event_connection = rusqlite::Connection::open(&database_name).unwrap();
+    let idempotency_connection = rusqlite::Connection::open(&database_name).unwrap();
+    let store = ddd_cqrs_es::SqliteEventStore::<Counter>::new(event_connection).unwrap();
+    store.initialize_schema().unwrap();
+    let idempotency =
+        ddd_cqrs_es::SqliteIdempotencyStore::<EventStream<Counter>>::new(idempotency_connection)
+            .unwrap();
+    let key = IdempotencyKey::new("sqlite-atomic-pending-request");
+    idempotency.reserve(key.clone()).unwrap();
+
+    let repo = Repository::new(store);
+    let error = repo
+        .execute_idempotent_atomic_with_wait_config(
+            &"sqlite-atomic-pending-counter".to_owned(),
+            CounterCommand::Create,
+            Metadata::default(),
+            key.clone(),
+            IdempotencyWaitConfig::new(Duration::from_millis(5), Duration::from_millis(1)),
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ddd_cqrs_es::IdempotentRepositoryError::IdempotencyPendingTimeout {
+            key: timeout_key,
+            ..
+        } if timeout_key == key
+    ));
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_snapshot_store_persists_latest_snapshot() {
+    let connection = rusqlite::Connection::open_in_memory().unwrap();
+    let store = ddd_cqrs_es::SqliteSnapshotStore::<Counter>::new(connection).unwrap();
+    let counter_id = "sqlite-snapshot-counter".to_owned();
+    let older = Counter {
+        id: Some(counter_id.clone()),
+        value: 1,
+        revision: 1,
+    };
+    let newer = Counter {
+        id: Some(counter_id.clone()),
+        value: 7,
+        revision: 2,
+    };
+
+    ddd_cqrs_es::assert_snapshot_store_contract::<Counter, _>(
+        store.clone(),
+        counter_id.clone(),
+        older.clone(),
+        newer.clone(),
+    );
+    store
+        .save_snapshot(Snapshot::new(
+            counter_id.clone(),
+            1,
+            older,
+            Metadata::default(),
+        ))
+        .unwrap();
+
+    let loaded = store.load_snapshot(&counter_id).unwrap().unwrap();
+    assert_eq!(loaded.revision, 2);
+    assert_eq!(loaded.state, newer);
 }
 
 #[cfg(feature = "postgres")]
@@ -279,6 +558,7 @@ fn postgres_store_passes_reusable_contract_when_url_is_provided() {
         "postgres-contract-counter".to_owned(),
         CounterEvent::Created,
         CounterEvent::Incremented { by: 1 },
+        EventStoreContractOptions::default(),
     );
 }
 
@@ -380,6 +660,90 @@ fn metadata_and_global_sequence_are_preserved() {
     let global = store.load_global_after(None).unwrap();
     assert_eq!(global.len(), 1);
     assert_eq!(global[0].sequence, Some(1));
+}
+
+#[test]
+fn projection_runner_error_formats_and_exposes_source() {
+    let error: ddd_cqrs_es::ProjectionRunnerError<std::io::Error, std::io::Error, std::io::Error> =
+        ddd_cqrs_es::ProjectionRunnerError::Store(std::io::Error::other("store failed"));
+
+    assert_eq!(error.to_string(), "store failed");
+    assert!(error.source().is_some());
+}
+
+#[test]
+fn event_store_error_preserves_sources_without_changing_display() {
+    let error = EventStoreError::backend_with_source(
+        "database unavailable",
+        std::io::Error::other("socket refused"),
+    );
+
+    assert_eq!(
+        error.to_string(),
+        "event store backend error: database unavailable"
+    );
+    assert!(error.source().is_some());
+
+    #[cfg(feature = "json")]
+    {
+        let source = serde_json::from_str::<CounterEvent>("not json").unwrap_err();
+        let error = EventStoreError::deserialization_with_source(
+            format!("event payload: {source}"),
+            source,
+        );
+
+        assert!(error.to_string().starts_with("deserialization error:"));
+        assert!(error.source().is_some());
+    }
+}
+
+#[test]
+fn process_manager_runner_dispatches_emitted_commands() {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Event {
+        Created,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Command {
+        SendEmail,
+    }
+
+    #[derive(Clone, Debug)]
+    struct WelcomeProcess;
+
+    impl ddd_cqrs_es::ProcessManager<Event, Command> for WelcomeProcess {
+        type Error = std::convert::Infallible;
+
+        fn name(&self) -> &'static str {
+            "welcome"
+        }
+
+        fn handle(&mut self, event: &Event) -> Result<Vec<Command>, Self::Error> {
+            match event {
+                Event::Created => Ok(vec![Command::SendEmail]),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct RecordingBus;
+
+    impl ddd_cqrs_es::CommandBus<Command> for RecordingBus {
+        type Output = &'static str;
+        type Error = std::convert::Infallible;
+
+        fn dispatch(&self, command: Command) -> Result<Self::Output, Self::Error> {
+            match command {
+                Command::SendEmail => Ok("sent"),
+            }
+        }
+    }
+
+    let mut runner = ddd_cqrs_es::ProcessManagerRunner::new(WelcomeProcess, RecordingBus);
+    let outputs = runner.run(&Event::Created).unwrap();
+
+    assert_eq!(outputs, vec!["sent"]);
 }
 
 #[cfg(feature = "uuid")]
@@ -580,6 +944,149 @@ fn projection_runner_resumes_from_checkpoint() {
     assert_eq!(runner.projection().values[&counter_id], 4);
 }
 
+#[cfg(feature = "sqlite")]
+#[test]
+fn transactional_projection_rolls_back_read_model_and_checkpoint_together() {
+    use rusqlite::OptionalExtension;
+
+    struct SqliteTransactionalCounterProjection {
+        connection: rusqlite::Connection,
+        fail_on_sequence: Option<u64>,
+    }
+
+    impl SqliteTransactionalCounterProjection {
+        fn new(fail_on_sequence: Option<u64>) -> Self {
+            let connection = rusqlite::Connection::open_in_memory().unwrap();
+            connection
+                .execute_batch(
+                    r#"
+                    CREATE TABLE counter_values (
+                        id TEXT PRIMARY KEY,
+                        value INTEGER NOT NULL
+                    );
+                    CREATE TABLE tx_checkpoints (
+                        projection_name TEXT PRIMARY KEY,
+                        sequence INTEGER NOT NULL
+                    );
+                    "#,
+                )
+                .unwrap();
+            Self {
+                connection,
+                fail_on_sequence,
+            }
+        }
+
+        fn counter_value(&self, id: &str) -> u64 {
+            self.connection
+                .query_row(
+                    "SELECT value FROM counter_values WHERE id = ?1",
+                    [id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap()
+                .unwrap_or(0) as u64
+        }
+    }
+
+    impl ddd_cqrs_es::TransactionalCheckpointedProjection<CounterEvent, String>
+        for SqliteTransactionalCounterProjection
+    {
+        type Error = String;
+
+        fn name(&self) -> &'static str {
+            "sqlite_tx_counter_projection"
+        }
+
+        fn load_checkpoint(&self) -> Result<Option<u64>, Self::Error> {
+            self.connection
+                .query_row(
+                    "SELECT sequence FROM tx_checkpoints WHERE projection_name = ?1",
+                    [self.name()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map(|value| value.map(|sequence| sequence as u64))
+                .map_err(|error| error.to_string())
+        }
+
+        fn apply_and_checkpoint_transactionally(
+            &mut self,
+            event: &ddd_cqrs_es::EventEnvelope<CounterEvent, String>,
+        ) -> Result<(), Self::Error> {
+            let projection_name = self.name();
+            let transaction = self
+                .connection
+                .transaction()
+                .map_err(|error| error.to_string())?;
+
+            match event.payload {
+                CounterEvent::Created => {
+                    transaction
+                        .execute(
+                            "INSERT INTO counter_values (id, value)
+                             VALUES (?1, 0)
+                             ON CONFLICT(id) DO NOTHING",
+                            [event.aggregate_id.as_str()],
+                        )
+                        .map_err(|error| error.to_string())?;
+                }
+                CounterEvent::Incremented { by } => {
+                    transaction
+                        .execute(
+                            "INSERT INTO counter_values (id, value)
+                             VALUES (?1, ?2)
+                             ON CONFLICT(id) DO UPDATE SET value = value + excluded.value",
+                            rusqlite::params![event.aggregate_id.as_str(), by as i64],
+                        )
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+
+            if event.sequence == self.fail_on_sequence {
+                return Err("projection failed".to_owned());
+            }
+
+            if let Some(sequence) = event.sequence {
+                transaction
+                    .execute(
+                        "INSERT INTO tx_checkpoints (projection_name, sequence)
+                         VALUES (?1, ?2)
+                         ON CONFLICT(projection_name) DO UPDATE
+                         SET sequence = excluded.sequence
+                         WHERE excluded.sequence > tx_checkpoints.sequence",
+                        rusqlite::params![projection_name, sequence as i64],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+
+            transaction.commit().map_err(|error| error.to_string())
+        }
+    }
+
+    let store = InMemoryEventStore::<Counter>::new();
+    let repo = Repository::new(store.clone());
+    let counter_id = "sqlite-transactional-projection".to_owned();
+    repo.execute(&counter_id, CounterCommand::Create, Metadata::default())
+        .unwrap();
+    repo.execute(
+        &counter_id,
+        CounterCommand::Increment { by: 4 },
+        Metadata::default(),
+    )
+    .unwrap();
+
+    let projection = SqliteTransactionalCounterProjection::new(Some(2));
+    let mut runner = ddd_cqrs_es::TransactionalCheckpointedProjectionRunner::new(projection);
+    assert!(runner.run::<Counter, _>(&store).is_err());
+    assert_eq!(runner.projection().counter_value(&counter_id), 0);
+
+    runner.projection_mut().fail_on_sequence = None;
+    assert_eq!(runner.run::<Counter, _>(&store).unwrap(), 1);
+    assert_eq!(runner.projection().counter_value(&counter_id), 4);
+}
+
 #[test]
 fn repository_loads_from_snapshot_and_replays_later_events() {
     let store = InMemoryEventStore::<Counter>::new();
@@ -647,6 +1154,78 @@ fn repository_returns_previous_result_for_idempotent_retry() {
 
     assert_eq!(first, retry);
     assert_eq!(store.load(&counter_id).unwrap().len(), 1);
+}
+
+#[test]
+fn repository_idempotent_pending_key_times_out() {
+    let store = InMemoryEventStore::<Counter>::new();
+    let idempotency = InMemoryIdempotencyStore::new();
+    let repo = Repository::new(store);
+    let counter_id = "pending-counter".to_owned();
+    let key = IdempotencyKey::new("pending-request");
+    idempotency.reserve(key.clone()).unwrap();
+
+    let error = repo
+        .execute_idempotent_with_wait_config(
+            &counter_id,
+            CounterCommand::Create,
+            Metadata::default(),
+            key.clone(),
+            &idempotency,
+            IdempotencyWaitConfig::new(Duration::from_millis(5), Duration::from_millis(1)),
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ddd_cqrs_es::IdempotentRepositoryError::IdempotencyPendingTimeout {
+            key: timeout_key,
+            ..
+        } if timeout_key == key
+    ));
+}
+
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+#[test]
+fn sql_schema_config_rejects_invalid_table_names_eagerly() {
+    let result = ddd_cqrs_es::SqlSchemaConfig::new(ddd_cqrs_es::SqlDialect::Sqlite)
+        .with_events_table("not-valid-table-name");
+
+    assert!(result.is_err());
+    let result = ddd_cqrs_es::SqlSchemaConfig::new(ddd_cqrs_es::SqlDialect::Sqlite)
+        .with_snapshots_table("not-valid-table-name");
+
+    assert!(result.is_err());
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_schema_creates_replay_index_without_duplicate_stream_index() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let config = ddd_cqrs_es::SqlSchemaConfig::new(ddd_cqrs_es::SqlDialect::Sqlite)
+        .with_events_table("custom_events")
+        .unwrap();
+    let migrator = ddd_cqrs_es::SchemaMigrator::new(config);
+
+    migrator.run_sqlite(&conn).unwrap();
+
+    let replay_index_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'custom_events_global_replay_idx'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let duplicate_stream_index_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'custom_events_stream_idx'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(replay_index_count, 1);
+    assert_eq!(duplicate_stream_index_count, 0);
 }
 
 #[test]
@@ -725,6 +1304,24 @@ mod async_tests {
     }
 
     #[tokio::test]
+    async fn async_repository_execute_returning_state_loads_stream_once() {
+        let store = LoadCountingStore::new(InMemoryEventStore::<Counter>::new());
+        let observed_store = store.clone();
+        let repo = AsyncRepository::new(store);
+        let counter_id = "async-counter-load-once".to_owned();
+
+        let (loaded, committed) = repo
+            .execute_returning_state(&counter_id, CounterCommand::Create, Metadata::default())
+            .await
+            .unwrap();
+
+        assert_eq!(observed_store.load_count(), 1);
+        assert_eq!(committed.len(), 1);
+        assert_eq!(loaded.revision, 1);
+        assert!(loaded.state.id.is_some());
+    }
+
+    #[tokio::test]
     async fn test_async_repository_with_snapshots() {
         let store = InMemoryEventStore::<Counter>::new();
         let snapshots = InMemorySnapshotStore::<Counter>::new();
@@ -796,6 +1393,118 @@ mod async_tests {
         assert_eq!(first, retry);
         let events = AsyncEventStore::load(&store, &counter_id).await.unwrap();
         assert_eq!(events.len(), 1);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_async_atomic_idempotent_retry_returns_original_committed_events() {
+        let store = ddd_cqrs_es::SqliteEventStore::<Counter>::in_memory().unwrap();
+        let repo = AsyncRepository::new(store.clone());
+        let counter_id = "sqlite-async-atomic-counter".to_owned();
+        let key = IdempotencyKey::new("sqlite-async-atomic-request");
+
+        let first = repo
+            .execute_idempotent_atomic(
+                &counter_id,
+                CounterCommand::Create,
+                Metadata::default(),
+                key.clone(),
+            )
+            .await
+            .unwrap();
+        let retry = repo
+            .execute_idempotent_atomic(
+                &counter_id,
+                CounterCommand::Increment { by: 9 },
+                Metadata::default(),
+                key,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first, retry);
+        let events = AsyncEventStore::load(&store, &counter_id).await.unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn async_repository_idempotent_pending_key_times_out() {
+        let store = InMemoryEventStore::<Counter>::new();
+        let idempotency = InMemoryIdempotencyStore::new();
+        let repo = AsyncRepository::new(store);
+        let counter_id = "async-pending-counter".to_owned();
+        let key = IdempotencyKey::new("async-pending-request");
+        idempotency.reserve(key.clone()).unwrap();
+
+        let error = repo
+            .execute_idempotent_with_wait_config(
+                &counter_id,
+                CounterCommand::Create,
+                Metadata::default(),
+                key.clone(),
+                &idempotency,
+                IdempotencyWaitConfig::new(Duration::from_millis(5), Duration::from_millis(1)),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ddd_cqrs_es::IdempotentRepositoryError::IdempotencyPendingTimeout {
+                key: timeout_key,
+                ..
+            } if timeout_key == key
+        ));
+    }
+
+    #[tokio::test]
+    async fn async_process_manager_runner_dispatches_emitted_commands() {
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        enum Event {
+            Created,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        enum Command {
+            SendEmail,
+        }
+
+        #[derive(Clone, Debug)]
+        struct WelcomeProcess;
+
+        impl ddd_cqrs_es::ProcessManager<Event, Command> for WelcomeProcess {
+            type Error = std::convert::Infallible;
+
+            fn name(&self) -> &'static str {
+                "welcome"
+            }
+
+            fn handle(&mut self, event: &Event) -> Result<Vec<Command>, Self::Error> {
+                match event {
+                    Event::Created => Ok(vec![Command::SendEmail]),
+                }
+            }
+        }
+
+        #[derive(Clone, Debug)]
+        struct RecordingBus;
+
+        #[async_trait::async_trait]
+        impl ddd_cqrs_es::AsyncCommandBus<Command> for RecordingBus {
+            type Output = &'static str;
+            type Error = std::convert::Infallible;
+
+            async fn dispatch(&self, command: Command) -> Result<Self::Output, Self::Error> {
+                match command {
+                    Command::SendEmail => Ok("sent"),
+                }
+            }
+        }
+
+        let mut runner = ddd_cqrs_es::AsyncProcessManagerRunner::new(WelcomeProcess, RecordingBus);
+        let outputs = runner.run(&Event::Created).await.unwrap();
+
+        assert_eq!(outputs, vec!["sent"]);
     }
 
     #[tokio::test]
@@ -968,6 +1677,8 @@ fn test_sqlite_checkpoint_store() {
     assert_eq!(store.load_checkpoint("proj1").unwrap(), Some(42));
     store.save_checkpoint("proj1", 100).unwrap();
     assert_eq!(store.load_checkpoint("proj1").unwrap(), Some(100));
+    store.save_checkpoint("proj1", 90).unwrap();
+    assert_eq!(store.load_checkpoint("proj1").unwrap(), Some(100));
 }
 
 #[cfg(feature = "sqlite")]
@@ -1101,6 +1812,8 @@ fn test_postgres_checkpoint_store() {
     store.save_checkpoint("proj1", 42).unwrap();
     assert_eq!(store.load_checkpoint("proj1").unwrap(), Some(42));
     store.save_checkpoint("proj1", 100).unwrap();
+    assert_eq!(store.load_checkpoint("proj1").unwrap(), Some(100));
+    store.save_checkpoint("proj1", 90).unwrap();
     assert_eq!(store.load_checkpoint("proj1").unwrap(), Some(100));
 
     let mut client = postgres::Client::connect(&database_url, postgres::NoTls).unwrap();
@@ -1333,6 +2046,7 @@ fn test_mysql_store_passes_reusable_contract_when_url_is_provided() {
         "mysql-contract-counter".to_owned(),
         CounterEvent::Created,
         CounterEvent::Incremented { by: 1 },
+        EventStoreContractOptions::default(),
     );
 }
 
@@ -1358,6 +2072,8 @@ fn test_mysql_checkpoint_store() {
     store.save_checkpoint("proj1", 42).unwrap();
     assert_eq!(store.load_checkpoint("proj1").unwrap(), Some(42));
     store.save_checkpoint("proj1", 100).unwrap();
+    assert_eq!(store.load_checkpoint("proj1").unwrap(), Some(100));
+    store.save_checkpoint("proj1", 90).unwrap();
     assert_eq!(store.load_checkpoint("proj1").unwrap(), Some(100));
 }
 

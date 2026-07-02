@@ -29,7 +29,6 @@ use std::time::SystemTime;
 /// #     type Event = DummyEvent;
 /// #     type Error = ();
 /// #     fn aggregate_type() -> &'static str { "dummy" }
-/// #     fn id(&self) -> Option<&Self::Id> { None }
 /// #     fn revision(&self) -> u64 { 0 }
 /// #     fn new() -> Self { MyAggregate }
 /// #     fn apply(&mut self, _event: &Self::Event) {}
@@ -129,7 +128,6 @@ impl Error for InMemorySnapshotError {}
 /// #     type Event = DummyEvent;
 /// #     type Error = ();
 /// #     fn aggregate_type() -> &'static str { "dummy" }
-/// #     fn id(&self) -> Option<&Self::Id> { None }
 /// #     fn revision(&self) -> u64 { 0 }
 /// #     fn new() -> Self { MyAggregate }
 /// #     fn apply(&mut self, _event: &Self::Event) {}

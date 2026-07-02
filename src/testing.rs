@@ -1,8 +1,11 @@
 use crate::aggregate::Aggregate;
-use crate::error::{ConcurrencyError, EventStoreError};
+use crate::error::{ConcurrencyError, EventStoreFailure, RepositoryError};
 use crate::event::{ExpectedRevision, NewEvent};
 use crate::event_store::EventStore;
+use crate::idempotency::{IdempotencyKey, IdempotencyState, IdempotencyStore};
 use crate::metadata::Metadata;
+use crate::projection::CheckpointStore;
+use crate::snapshot::{Snapshot, SnapshotStore};
 use std::fmt::Debug;
 
 /// Fluent aggregate test fixture.
@@ -28,7 +31,6 @@ use std::fmt::Debug;
 /// #     type Event = CounterEvent;
 /// #     type Error = &'static str;
 /// #     fn aggregate_type() -> &'static str { "counter" }
-/// #     fn id(&self) -> Option<&Self::Id> { None }
 /// #     fn revision(&self) -> u64 { self.revision }
 /// #     fn new() -> Self { Self::default() }
 /// #     fn apply(&mut self, event: &Self::Event) {
@@ -59,6 +61,34 @@ where
     given: Vec<A::Event>,
 }
 
+/// Options for the reusable event-store contract test.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EventStoreContractOptions {
+    expected_first_global_sequence: Option<u64>,
+}
+
+impl EventStoreContractOptions {
+    /// Expects the first appended event to have the provided global sequence.
+    pub fn with_expected_first_global_sequence(sequence: u64) -> Self {
+        Self {
+            expected_first_global_sequence: Some(sequence),
+        }
+    }
+
+    /// Skips exact global sequence-number assertions.
+    pub fn without_exact_global_sequence_assertions() -> Self {
+        Self {
+            expected_first_global_sequence: None,
+        }
+    }
+}
+
+impl Default for EventStoreContractOptions {
+    fn default() -> Self {
+        Self::with_expected_first_global_sequence(1)
+    }
+}
+
 /// Runs the common event-store contract against a store implementation.
 ///
 /// Adapter crates can call this from their own integration tests to verify
@@ -69,10 +99,12 @@ pub fn assert_event_store_contract<A, S>(
     aggregate_id: A::Id,
     first_event: A::Event,
     second_event: A::Event,
+    options: EventStoreContractOptions,
 ) where
     A: Aggregate,
     A::Event: PartialEq + Debug,
-    S: EventStore<A, Error = EventStoreError>,
+    S: EventStore<A>,
+    S::Error: EventStoreFailure + Debug,
 {
     assert!(store.load(&aggregate_id).unwrap().is_empty());
 
@@ -86,7 +118,9 @@ pub fn assert_event_store_contract<A, S>(
         .unwrap();
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].revision, 1);
-    assert_eq!(first[0].sequence, Some(1));
+    if let Some(expected) = options.expected_first_global_sequence {
+        assert_eq!(first[0].sequence, Some(expected));
+    }
     assert_eq!(first[0].metadata, first_metadata);
 
     let duplicate = store.append(
@@ -97,10 +131,10 @@ pub fn assert_event_store_contract<A, S>(
     let Err(duplicate) = duplicate else {
         panic!("expected NoStream append to fail after stream creation");
     };
-    assert_eq!(
-        duplicate,
-        EventStoreError::Concurrency(ConcurrencyError::StreamAlreadyExists)
-    );
+    assert!(matches!(
+        duplicate.into_repository_error::<()>(),
+        RepositoryError::Concurrency(ConcurrencyError::StreamAlreadyExists)
+    ));
 
     let second = store
         .append(
@@ -110,16 +144,138 @@ pub fn assert_event_store_contract<A, S>(
         )
         .unwrap();
     assert_eq!(second[0].revision, 2);
-    assert_eq!(second[0].sequence, Some(2));
+    if let Some(expected) = options.expected_first_global_sequence {
+        assert_eq!(second[0].sequence, Some(expected + 1));
+    }
 
     let stream = store.load(&aggregate_id).unwrap();
     assert_eq!(stream.len(), 2);
     assert_eq!(stream[0].payload, first_event);
     assert_eq!(stream[1].payload, second_event);
 
-    let global = store.load_global_after(Some(1)).unwrap();
-    assert_eq!(global.len(), 1);
-    assert_eq!(global[0].revision, 2);
+    if let Some(first_sequence) = first[0].sequence {
+        let global = store.load_global_after(Some(first_sequence)).unwrap();
+        assert_eq!(global.len(), 1);
+        assert_eq!(global[0].revision, 2);
+    }
+}
+
+/// Runs a focused global replay contract against a store implementation.
+pub fn assert_event_store_global_replay_contract<A, S>(
+    store: S,
+    first_id: A::Id,
+    second_id: A::Id,
+    first_event: A::Event,
+    second_event: A::Event,
+) where
+    A: Aggregate,
+    A::Event: PartialEq + Debug,
+    S: EventStore<A>,
+    S::Error: Debug,
+{
+    store
+        .append(
+            &first_id,
+            ExpectedRevision::NoStream,
+            vec![NewEvent::new(first_event.clone(), Metadata::default())],
+        )
+        .unwrap();
+    let first_global = store.load_global_after(None).unwrap();
+    let first_sequence = first_global[0].sequence;
+
+    store
+        .append(
+            &second_id,
+            ExpectedRevision::NoStream,
+            vec![NewEvent::new(second_event.clone(), Metadata::default())],
+        )
+        .unwrap();
+
+    let all_global = store.load_global_after(None).unwrap();
+    assert_eq!(all_global.len(), 2);
+    assert_eq!(all_global[0].payload, first_event);
+    assert_eq!(all_global[1].payload, second_event);
+
+    if let Some(sequence) = first_sequence {
+        let after_first = store.load_global_after(Some(sequence)).unwrap();
+        assert_eq!(after_first.len(), 1);
+        assert_eq!(after_first[0].payload, second_event);
+    }
+}
+
+/// Runs a focused checkpoint-store contract.
+pub fn assert_checkpoint_store_contract<C>(store: C, projection_name: &str)
+where
+    C: CheckpointStore,
+    C::Error: Debug,
+{
+    assert_eq!(store.load_checkpoint(projection_name).unwrap(), None);
+    store.save_checkpoint(projection_name, 42).unwrap();
+    assert_eq!(store.load_checkpoint(projection_name).unwrap(), Some(42));
+    store.save_checkpoint(projection_name, 100).unwrap();
+    assert_eq!(store.load_checkpoint(projection_name).unwrap(), Some(100));
+    store.save_checkpoint(projection_name, 90).unwrap();
+    assert_eq!(store.load_checkpoint(projection_name).unwrap(), Some(100));
+}
+
+/// Runs a focused idempotency-store contract.
+pub fn assert_idempotency_store_contract<S, V>(store: S, key: IdempotencyKey, value: V)
+where
+    S: IdempotencyStore<V>,
+    S::Error: Debug,
+    V: Clone + PartialEq + Debug,
+{
+    assert_eq!(store.load(&key).unwrap(), None);
+    assert!(store.reserve(key.clone()).unwrap());
+    assert_eq!(store.load(&key).unwrap(), Some(IdempotencyState::Pending));
+    assert!(!store.reserve(key.clone()).unwrap());
+    store.save(key.clone(), value.clone()).unwrap();
+    assert_eq!(
+        store.load(&key).unwrap(),
+        Some(IdempotencyState::Complete(value))
+    );
+    assert!(!store.reserve(key.clone()).unwrap());
+    store.remove(&key).unwrap();
+    assert_eq!(store.load(&key).unwrap(), None);
+}
+
+/// Runs a focused snapshot-store contract.
+pub fn assert_snapshot_store_contract<A, S>(store: S, aggregate_id: A::Id, older: A, newer: A)
+where
+    A: Aggregate + Clone + PartialEq + Debug,
+    A::Id: Debug,
+    S: SnapshotStore<A>,
+    S::Error: Debug,
+{
+    assert_eq!(store.load_snapshot(&aggregate_id).unwrap(), None);
+
+    store
+        .save_snapshot(Snapshot::new(
+            aggregate_id.clone(),
+            1,
+            older.clone(),
+            Metadata::default(),
+        ))
+        .unwrap();
+    assert_eq!(
+        store
+            .load_snapshot(&aggregate_id)
+            .unwrap()
+            .map(|snapshot| snapshot.state),
+        Some(older)
+    );
+
+    store
+        .save_snapshot(Snapshot::new(
+            aggregate_id.clone(),
+            2,
+            newer.clone(),
+            Metadata::default(),
+        ))
+        .unwrap();
+    let loaded = store.load_snapshot(&aggregate_id).unwrap().unwrap();
+    assert_eq!(loaded.revision, 2);
+    assert_eq!(loaded.state, newer);
 }
 
 impl<A> AggregateFixture<A>
@@ -145,7 +301,7 @@ where
 
     /// Handles a command against replayed state.
     pub fn when(self, command: A::Command) -> AggregateFixtureResult<A> {
-        let loaded = A::replay_events(&self.given);
+        let loaded = A::replay_raw_events_from_zero(&self.given);
         let result = loaded.state.handle(command);
 
         AggregateFixtureResult {

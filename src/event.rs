@@ -16,7 +16,63 @@ pub type Revision = u64;
 pub const INITIAL_REVISION: Revision = 0;
 
 /// Stable event type name stored with an event envelope.
-pub type EventType = String;
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(transparent))]
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EventType(String);
+
+impl EventType {
+    /// Creates an event type from a stable event name.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Returns the event type as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consumes the event type and returns the owned string.
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl From<&str> for EventType {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+impl From<String> for EventType {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl AsRef<str> for EventType {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl Display for EventType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl PartialEq<&str> for EventType {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<EventType> for &str {
+    fn eq(&self, other: &EventType) -> bool {
+        *self == other.as_str()
+    }
+}
 
 /// A unique identifier assigned to a persisted event.
 ///
@@ -163,7 +219,7 @@ pub enum ExpectedRevision {
 /// }
 ///
 /// let new_event = NewEvent::new(MyEvent, Metadata::default());
-/// assert_eq!(new_event.event_type, "my_event");
+/// assert_eq!(new_event.event_type.as_str(), "my_event");
 /// assert_eq!(new_event.event_version, 1);
 /// ```
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -185,15 +241,7 @@ impl<E> NewEvent<E> {
     where
         E: DomainEvent,
     {
-        Self::from_domain_event(payload, metadata)
-    }
-
-    /// Creates a new event using stable metadata from [`DomainEvent`].
-    pub fn from_domain_event(payload: E, metadata: Metadata) -> Self
-    where
-        E: DomainEvent,
-    {
-        let event_type = payload.event_type().to_owned();
+        let event_type = EventType::from(payload.event_type());
         let event_version = payload.event_version();
 
         Self {
@@ -205,7 +253,7 @@ impl<E> NewEvent<E> {
     }
 
     /// Creates a new event with an explicit stable event type.
-    pub fn with_type(payload: E, event_type: impl Into<String>, metadata: Metadata) -> Self {
+    pub fn with_type(payload: E, event_type: impl Into<EventType>, metadata: Metadata) -> Self {
         Self {
             payload,
             event_type: event_type.into(),
@@ -279,7 +327,7 @@ impl<E, Id> EventEnvelope<E, Id> {
         aggregate_type: impl Into<String>,
         revision: Revision,
         sequence: Option<u64>,
-        event_type: impl Into<String>,
+        event_type: impl Into<EventType>,
         event_version: u32,
         payload: E,
         metadata: Metadata,
@@ -333,8 +381,9 @@ impl<E, Id> EventEnvelope<E, Id> {
         E: serde::Serialize,
         Id: serde::Serialize,
     {
-        serde_json::to_string(self)
-            .map_err(|error| crate::error::EventStoreError::Serialization(error.to_string()))
+        serde_json::to_string(self).map_err(|error| {
+            crate::error::EventStoreError::serialization_with_source(error.to_string(), error)
+        })
     }
 
     /// Deserializes an envelope from JSON.
@@ -344,7 +393,8 @@ impl<E, Id> EventEnvelope<E, Id> {
         E: serde::de::DeserializeOwned,
         Id: serde::de::DeserializeOwned,
     {
-        serde_json::from_str(json)
-            .map_err(|error| crate::error::EventStoreError::Deserialization(error.to_string()))
+        serde_json::from_str(json).map_err(|error| {
+            crate::error::EventStoreError::deserialization_with_source(error.to_string(), error)
+        })
     }
 }

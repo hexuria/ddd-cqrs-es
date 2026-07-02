@@ -2,9 +2,11 @@
 
 use crate::aggregate::{Aggregate, LoadedAggregate};
 use crate::error::{EventStoreFailure, RepositoryError};
-use crate::event::{ExpectedRevision, NewEvent};
-use crate::event_store::EventStream;
-use crate::idempotency::{IdempotencyKey, IdempotencyState, IdempotentRepositoryError};
+use crate::event::{EventEnvelope, ExpectedRevision, NewEvent};
+use crate::event_store::{EventStream, IdempotentAppendError};
+use crate::idempotency::{
+    IdempotencyKey, IdempotencyState, IdempotencyWaitConfig, IdempotentRepositoryError,
+};
 use crate::metadata::Metadata;
 use crate::snapshot::{Snapshot, SnapshotRepositoryError};
 use async_trait::async_trait;
@@ -48,9 +50,36 @@ where
         -> Result<EventStream<A>, Self::Error>;
 }
 
+/// Async event store extension for transaction-aware idempotent appends.
+#[async_trait]
+pub trait AsyncAtomicIdempotentEventStore<A>: AsyncEventStore<A>
+where
+    A: Aggregate + Send + Sync,
+{
+    /// Appends events once for the idempotency key, atomically with the
+    /// idempotency completion record.
+    async fn append_idempotent(
+        &self,
+        idempotency_key: IdempotencyKey,
+        aggregate_id: &A::Id,
+        expected_revision: ExpectedRevision,
+        events: Vec<NewEvent<A::Event>>,
+    ) -> Result<EventStream<A>, IdempotentAppendError<Self::Error>>;
+}
+
 /// Result type returned by async repository operations.
 pub type AsyncRepositoryResult<A, S, T> =
     Result<T, RepositoryError<<A as Aggregate>::Error, <S as AsyncEventStore<A>>::Error>>;
+
+/// Result type returned by async atomic idempotent repository operations.
+pub type AsyncAtomicIdempotentRepositoryResult<A, S, T> = Result<
+    T,
+    IdempotentRepositoryError<
+        <A as Aggregate>::Error,
+        <S as AsyncEventStore<A>>::Error,
+        <S as AsyncEventStore<A>>::Error,
+    >,
+>;
 
 /// Coordinates aggregate loading, command execution, and async event appending.
 ///
@@ -80,7 +109,6 @@ pub type AsyncRepositoryResult<A, S, T> =
 /// #     type Event = DummyEvent;
 /// #     type Error = DummyError;
 /// #     fn aggregate_type() -> &'static str { "dummy" }
-/// #     fn id(&self) -> Option<&Self::Id> { None }
 /// #     fn revision(&self) -> u64 { 0 }
 /// #     fn new() -> Self { MyAggregate }
 /// #     fn apply(&mut self, _event: &Self::Event) {}
@@ -141,6 +169,9 @@ where
         &self,
         aggregate_id: &A::Id,
     ) -> AsyncRepositoryResult<A, S, LoadedAggregate<A>> {
+        #[cfg(feature = "tracing")]
+        tracing::debug!(aggregate_type = A::aggregate_type(), "loading aggregate");
+
         let events = self
             .store
             .load(aggregate_id)
@@ -156,6 +187,9 @@ where
         command: A::Command,
         metadata: Metadata,
     ) -> AsyncRepositoryResult<A, S, EventStream<A>> {
+        #[cfg(feature = "tracing")]
+        tracing::debug!(aggregate_type = A::aggregate_type(), "executing command");
+
         let loaded = self.load(aggregate_id).await?;
         let events = loaded
             .state
@@ -184,6 +218,14 @@ where
         events: Vec<A::Event>,
         metadata: Metadata,
     ) -> AsyncRepositoryResult<A, S, EventStream<A>> {
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            aggregate_type = A::aggregate_type(),
+            expected_revision = loaded.revision,
+            event_count = events.len(),
+            "appending aggregate events"
+        );
+
         let events = events
             .into_iter()
             .map(|event| NewEvent::new(event, metadata.clone()))
@@ -223,9 +265,20 @@ where
         command: A::Command,
         metadata: Metadata,
     ) -> AsyncRepositoryResult<A, S, (LoadedAggregate<A>, EventStream<A>)> {
-        let committed = self.execute(aggregate_id, command, metadata).await?;
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            aggregate_type = A::aggregate_type(),
+            "executing command and returning state"
+        );
+
         let loaded = self.load(aggregate_id).await?;
-        Ok((loaded, committed))
+        let events = loaded
+            .state
+            .handle(command)
+            .map_err(RepositoryError::Domain)?;
+        let committed = self.save(aggregate_id, &loaded, events, metadata).await?;
+        let updated = apply_committed_events(loaded, &committed);
+        Ok((updated, committed))
     }
 
     /// Loads an aggregate using the latest snapshot, then replays events after
@@ -323,6 +376,32 @@ where
     where
         I: AsyncIdempotencyStore<EventStream<A>>,
     {
+        self.execute_idempotent_with_wait_config(
+            aggregate_id,
+            command,
+            metadata,
+            idempotency_key,
+            idempotency_store,
+            IdempotencyWaitConfig::default(),
+        )
+        .await
+    }
+
+    /// Executes a command once for an idempotency key using explicit pending-key wait limits.
+    pub async fn execute_idempotent_with_wait_config<I>(
+        &self,
+        aggregate_id: &A::Id,
+        command: A::Command,
+        metadata: Metadata,
+        idempotency_key: IdempotencyKey,
+        idempotency_store: &I,
+        wait_config: IdempotencyWaitConfig,
+    ) -> Result<EventStream<A>, IdempotentRepositoryError<A::Error, S::Error, I::Error>>
+    where
+        I: AsyncIdempotencyStore<EventStream<A>>,
+    {
+        let started = std::time::Instant::now();
+
         loop {
             match idempotency_store
                 .load(&idempotency_key)
@@ -333,7 +412,13 @@ where
                     return Ok(committed);
                 }
                 Some(IdempotencyState::Pending) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    let Some(delay) = wait_config.next_delay(started.elapsed()) else {
+                        return Err(IdempotentRepositoryError::IdempotencyPendingTimeout {
+                            key: idempotency_key,
+                            waited: started.elapsed(),
+                        });
+                    };
+                    tokio::time::sleep(delay).await;
                     continue;
                 }
                 None => {
@@ -344,6 +429,13 @@ where
                     {
                         break;
                     }
+                    let Some(delay) = wait_config.next_delay(started.elapsed()) else {
+                        return Err(IdempotentRepositoryError::IdempotencyPendingTimeout {
+                            key: idempotency_key,
+                            waited: started.elapsed(),
+                        });
+                    };
+                    tokio::time::sleep(delay).await;
                 }
             }
         }
@@ -391,6 +483,106 @@ where
 
         Ok(committed)
     }
+
+    /// Executes a command once using an event-store-native transaction-aware
+    /// idempotency record.
+    pub async fn execute_idempotent_atomic(
+        &self,
+        aggregate_id: &A::Id,
+        command: A::Command,
+        metadata: Metadata,
+        idempotency_key: IdempotencyKey,
+    ) -> AsyncAtomicIdempotentRepositoryResult<A, S, EventStream<A>>
+    where
+        S: AsyncAtomicIdempotentEventStore<A>,
+    {
+        self.execute_idempotent_atomic_with_wait_config(
+            aggregate_id,
+            command,
+            metadata,
+            idempotency_key,
+            IdempotencyWaitConfig::default(),
+        )
+        .await
+    }
+
+    /// Executes a command once using a transaction-aware idempotency record and
+    /// explicit pending-key wait limits.
+    pub async fn execute_idempotent_atomic_with_wait_config(
+        &self,
+        aggregate_id: &A::Id,
+        command: A::Command,
+        metadata: Metadata,
+        idempotency_key: IdempotencyKey,
+        wait_config: IdempotencyWaitConfig,
+    ) -> AsyncAtomicIdempotentRepositoryResult<A, S, EventStream<A>>
+    where
+        S: AsyncAtomicIdempotentEventStore<A>,
+    {
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            aggregate_type = A::aggregate_type(),
+            "executing atomic idempotent command"
+        );
+
+        let loaded = self.load(aggregate_id).await.map_err(|error| match error {
+            RepositoryError::Domain(error) => IdempotentRepositoryError::Domain(error),
+            RepositoryError::Concurrency(error) => IdempotentRepositoryError::Concurrency(error),
+            RepositoryError::Store(error) => IdempotentRepositoryError::Store(error),
+        })?;
+        let events = loaded
+            .state
+            .handle(command)
+            .map_err(IdempotentRepositoryError::Domain)?;
+        let events = events
+            .into_iter()
+            .map(|event| NewEvent::new(event, metadata.clone()))
+            .collect::<Vec<_>>();
+        let expected_revision = ExpectedRevision::Exact(loaded.revision);
+        let started = std::time::Instant::now();
+
+        loop {
+            match self
+                .store
+                .append_idempotent(
+                    idempotency_key.clone(),
+                    aggregate_id,
+                    expected_revision,
+                    events.clone(),
+                )
+                .await
+            {
+                Ok(committed) => return Ok(committed),
+                Err(IdempotentAppendError::Pending { .. }) => {
+                    let Some(delay) = wait_config.next_delay(started.elapsed()) else {
+                        return Err(IdempotentRepositoryError::IdempotencyPendingTimeout {
+                            key: idempotency_key,
+                            waited: started.elapsed(),
+                        });
+                    };
+                    tokio::time::sleep(delay).await;
+                }
+                Err(IdempotentAppendError::Store(error)) => {
+                    return Err(IdempotentRepositoryError::from_store_error(error));
+                }
+            }
+        }
+    }
+}
+
+fn apply_committed_events<A>(
+    mut loaded: LoadedAggregate<A>,
+    committed: &[EventEnvelope<A::Event, A::Id>],
+) -> LoadedAggregate<A>
+where
+    A: Aggregate,
+{
+    for envelope in committed {
+        loaded.state.apply(&envelope.payload);
+        loaded.revision = envelope.revision;
+    }
+
+    loaded
 }
 
 /// Async snapshot persistence abstraction.

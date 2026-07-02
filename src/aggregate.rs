@@ -33,7 +33,6 @@ use std::hash::Hash;
 ///     type Error = &'static str;
 ///
 ///     fn aggregate_type() -> &'static str { "counter" }
-///     fn id(&self) -> Option<&Self::Id> { None }
 ///     fn revision(&self) -> u64 { self.revision }
 ///     fn new() -> Self { Self { value: 0, revision: 0 } }
 ///
@@ -69,9 +68,6 @@ pub trait Aggregate: Sized {
     /// Stable aggregate type name used in event envelopes.
     fn aggregate_type() -> &'static str;
 
-    /// Returns the aggregate ID if this state has been created.
-    fn id(&self) -> Option<&Self::Id>;
-
     /// Returns the aggregate's own revision if it tracks one.
     fn revision(&self) -> Revision;
 
@@ -97,8 +93,11 @@ pub trait Aggregate: Sized {
         LoadedAggregate { state, revision }
     }
 
-    /// Rebuilds an aggregate from raw events for aggregate unit tests.
-    fn replay_events(events: &[Self::Event]) -> LoadedAggregate<Self> {
+    /// Rebuilds an aggregate from raw events starting at revision zero.
+    ///
+    /// This helper is intended for aggregate unit tests. Use [`Aggregate::replay`]
+    /// for persisted event envelopes because it preserves stored revisions.
+    fn replay_raw_events_from_zero(events: &[Self::Event]) -> LoadedAggregate<Self> {
         let mut state = Self::new();
 
         for event in events {

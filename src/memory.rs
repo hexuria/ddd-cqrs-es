@@ -52,7 +52,6 @@ where
 /// #     type Event = MyEvent;
 /// #     type Error = ();
 /// #     fn aggregate_type() -> &'static str { "my_aggregate" }
-/// #     fn id(&self) -> Option<&Self::Id> { None }
 /// #     fn revision(&self) -> u64 { 0 }
 /// #     fn new() -> Self { MyAggregate }
 /// #     fn apply(&mut self, _event: &Self::Event) {}
@@ -203,7 +202,7 @@ where
             .streams
             .entry(aggregate_id.clone())
             .or_default()
-            .extend(stream_events.clone());
+            .extend(stream_events.iter().cloned());
 
         Ok(stream_events)
     }

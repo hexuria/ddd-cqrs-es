@@ -1,11 +1,14 @@
 [package]
 name = "ddd_cqrs_es"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+rust-version = "1.93.0"
 authors = ["Uriah G"]
 description = "A lightweight DDD, CQRS, and Event Sourcing framework for Rust"
 license = "MIT"
 repository = "https://github.com/hexuria/ddd-cqrs-es"
+documentation = "https://docs.rs/ddd_cqrs_es"
+homepage = "https://github.com/hexuria/ddd-cqrs-es"
 keywords = ["ddd", "cqrs", "event-sourcing", "events"]
 categories = ["development-tools", "rust-patterns"]
 exclude = [".agents/**"]

@@ -53,7 +53,6 @@
 //!     type Error = CounterError;
 //!
 //!     fn aggregate_type() -> &'static str { "counter" }
-//!     fn id(&self) -> Option<&Self::Id> { None }
 //!     fn revision(&self) -> u64 { self.revision }
 //!     fn new() -> Self { Self::default() }
 //!
@@ -113,15 +112,15 @@ pub mod snapshot;
 mod sql_common;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
-pub mod store;
 pub mod testing;
 pub mod upcast;
 
 pub use aggregate::{Aggregate, LoadedAggregate};
 #[cfg(feature = "async")]
 pub use async_api::{
-    AsyncCommandBus, AsyncCommandHandler, AsyncEventStore, AsyncIdempotencyStore,
-    AsyncQueryHandler, AsyncRepository, AsyncRepositoryResult, AsyncSnapshotStore,
+    AsyncAtomicIdempotentEventStore, AsyncAtomicIdempotentRepositoryResult, AsyncCommandBus,
+    AsyncCommandHandler, AsyncEventStore, AsyncIdempotencyStore, AsyncQueryHandler,
+    AsyncRepository, AsyncRepositoryResult, AsyncSnapshotStore,
 };
 
 #[cfg(feature = "json-file")]
@@ -132,26 +131,35 @@ pub use event::{
     DomainEvent, EventEnvelope, EventId, EventType, ExpectedRevision, NewEvent, Revision,
     INITIAL_REVISION,
 };
-pub use event_store::{EventStore, EventStream, StandardEventStore};
+pub use event_store::{
+    AtomicIdempotentEventStore, EventStore, EventStream, IdempotentAppendError, StandardEventStore,
+};
 pub use idempotency::{
-    IdempotencyKey, IdempotencyState, IdempotencyStore, IdempotentRepositoryError,
-    InMemoryIdempotencyError, InMemoryIdempotencyStore,
+    IdempotencyKey, IdempotencyState, IdempotencyStore, IdempotencyWaitConfig,
+    IdempotentRepositoryError, InMemoryIdempotencyError, InMemoryIdempotencyStore,
+    DEFAULT_IDEMPOTENCY_PENDING_TIMEOUT, DEFAULT_IDEMPOTENCY_POLL_INTERVAL,
 };
 pub use memory::InMemoryEventStore;
 pub use metadata::Metadata;
 #[cfg(feature = "mysql")]
-pub use mysql::{MySqlCheckpointStore, MySqlEventStore, MySqlIdempotencyStore};
+pub use mysql::{MySqlCheckpointStore, MySqlEventStore, MySqlIdempotencyStore, MySqlSnapshotStore};
 #[cfg(feature = "postgres")]
-pub use postgres::{PostgresCheckpointStore, PostgresEventStore, PostgresIdempotencyStore};
-pub use process_manager::ProcessManager;
+pub use postgres::{
+    PostgresCheckpointStore, PostgresEventStore, PostgresIdempotencyStore, PostgresSnapshotStore,
+};
+#[cfg(feature = "async")]
+pub use process_manager::AsyncProcessManagerRunner;
+pub use process_manager::{ProcessManager, ProcessManagerRunner, ProcessManagerRunnerError};
 #[cfg(feature = "async")]
 pub use projection::{
     AsyncCheckpointStore, AsyncCheckpointedProjection, AsyncCheckpointedProjectionRunner,
-    AsyncPersistedProjectionRunner,
+    AsyncPersistedProjectionRunner, AsyncTransactionalCheckpointedProjection,
+    AsyncTransactionalCheckpointedProjectionRunner,
 };
 pub use projection::{
     CheckpointStore, CheckpointedProjection, CheckpointedProjectionRunner,
     InMemoryProjectionRunner, PersistedProjectionRunner, Projection, ProjectionRunnerError,
+    TransactionalCheckpointedProjection, TransactionalCheckpointedProjectionRunner,
 };
 #[cfg(feature = "spin-redis")]
 pub use redis::SpinRedisClient;
@@ -162,8 +170,8 @@ pub use redis::{
     RedisCheckpointStore, RedisCommandExecutor, RedisEventStore, RedisPubSubPublisher,
 };
 pub use repository::{
-    CommittedEvents, ExecutionOutcome, IdempotentRepositoryResult, Repository, RepositoryResult,
-    SnapshotRepositoryResult,
+    AtomicIdempotentRepositoryResult, CommittedEvents, ExecutionOutcome,
+    IdempotentRepositoryResult, Repository, RepositoryResult, SnapshotRepositoryResult,
 };
 #[cfg(feature = "async")]
 pub use schema::AsyncSchemaInitializer;
@@ -172,6 +180,12 @@ pub use snapshot::{
     InMemorySnapshotError, InMemorySnapshotStore, Snapshot, SnapshotRepositoryError, SnapshotStore,
 };
 #[cfg(feature = "sqlite")]
-pub use sqlite::{SqliteCheckpointStore, SqliteEventStore, SqliteIdempotencyStore};
-pub use testing::{assert_event_store_contract, AggregateFixture};
+pub use sqlite::{
+    SqliteCheckpointStore, SqliteEventStore, SqliteIdempotencyStore, SqliteSnapshotStore,
+};
+pub use testing::{
+    assert_checkpoint_store_contract, assert_event_store_contract,
+    assert_event_store_global_replay_contract, assert_idempotency_store_contract,
+    assert_snapshot_store_contract, AggregateFixture, EventStoreContractOptions,
+};
 pub use upcast::{ErasedUpcaster, EventUpcaster, UpcasterRegistry};

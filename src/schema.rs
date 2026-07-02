@@ -4,6 +4,7 @@
 //! for events, projection checkpoints, and idempotency keys, supporting SQLite,
 //! Postgres, and MySQL. It avoids external heavy migration libraries.
 
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
 use crate::error::EventStoreError;
 #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
 use std::collections::HashSet;
@@ -21,11 +22,12 @@ pub enum SqlDialect {
 /// Schema configuration with customizable table names.
 #[derive(Debug, Clone)]
 pub struct SqlSchemaConfig {
-    pub dialect: SqlDialect,
-    pub events_table: String,
-    pub checkpoints_table: String,
-    pub idempotency_table: String,
-    pub migrations_table: String,
+    dialect: SqlDialect,
+    events_table: String,
+    checkpoints_table: String,
+    idempotency_table: String,
+    snapshots_table: String,
+    migrations_table: String,
 }
 
 impl SqlSchemaConfig {
@@ -36,32 +38,107 @@ impl SqlSchemaConfig {
             events_table: "events".to_string(),
             checkpoints_table: "projection_checkpoints".to_string(),
             idempotency_table: "idempotency_keys".to_string(),
+            snapshots_table: "snapshots".to_string(),
             migrations_table: "schema_migrations".to_string(),
         }
     }
 
+    /// Returns the SQL dialect.
+    pub fn dialect(&self) -> SqlDialect {
+        self.dialect
+    }
+
+    /// Returns the configured events table name.
+    pub fn events_table(&self) -> &str {
+        &self.events_table
+    }
+
+    /// Returns the configured checkpoints table name.
+    pub fn checkpoints_table(&self) -> &str {
+        &self.checkpoints_table
+    }
+
+    /// Returns the configured idempotency table name.
+    pub fn idempotency_table(&self) -> &str {
+        &self.idempotency_table
+    }
+
+    /// Returns the configured snapshots table name.
+    pub fn snapshots_table(&self) -> &str {
+        &self.snapshots_table
+    }
+
+    /// Returns the configured migrations table name.
+    pub fn migrations_table(&self) -> &str {
+        &self.migrations_table
+    }
+
+    /// Validates all configured SQL table names.
+    #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+    pub fn validate(&self) -> Result<(), EventStoreError> {
+        crate::sql_common::validate_table_name(&self.events_table)?;
+        crate::sql_common::validate_table_name(&self.checkpoints_table)?;
+        crate::sql_common::validate_table_name(&self.idempotency_table)?;
+        crate::sql_common::validate_table_name(&self.snapshots_table)?;
+        crate::sql_common::validate_table_name(&self.migrations_table)?;
+        Ok(())
+    }
+
     /// Sets a custom events table name.
-    pub fn with_events_table(mut self, name: impl Into<String>) -> Self {
-        self.events_table = name.into();
-        self
+    #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+    pub fn with_events_table(mut self, name: impl Into<String>) -> Result<Self, EventStoreError> {
+        let name = name.into();
+        crate::sql_common::validate_table_name(&name)?;
+        self.events_table = name;
+        Ok(self)
     }
 
     /// Sets a custom checkpoints table name.
-    pub fn with_checkpoints_table(mut self, name: impl Into<String>) -> Self {
-        self.checkpoints_table = name.into();
-        self
+    #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+    pub fn with_checkpoints_table(
+        mut self,
+        name: impl Into<String>,
+    ) -> Result<Self, EventStoreError> {
+        let name = name.into();
+        crate::sql_common::validate_table_name(&name)?;
+        self.checkpoints_table = name;
+        Ok(self)
     }
 
     /// Sets a custom idempotency table name.
-    pub fn with_idempotency_table(mut self, name: impl Into<String>) -> Self {
-        self.idempotency_table = name.into();
-        self
+    #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+    pub fn with_idempotency_table(
+        mut self,
+        name: impl Into<String>,
+    ) -> Result<Self, EventStoreError> {
+        let name = name.into();
+        crate::sql_common::validate_table_name(&name)?;
+        self.idempotency_table = name;
+        Ok(self)
+    }
+
+    /// Sets a custom snapshots table name.
+    #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+    pub fn with_snapshots_table(
+        mut self,
+        name: impl Into<String>,
+    ) -> Result<Self, EventStoreError> {
+        let name = name.into();
+        crate::sql_common::validate_table_name(&name)?;
+        self.snapshots_table = name;
+        Ok(self)
     }
 
     /// Sets a custom migrations table name.
-    pub fn with_migrations_table(mut self, name: impl Into<String>) -> Self {
-        self.migrations_table = name.into();
-        self
+    #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+    pub fn with_migrations_table(
+        mut self,
+        name: impl Into<String>,
+    ) -> Result<Self, EventStoreError> {
+        let name = name.into();
+        crate::sql_common::validate_table_name(&name)?;
+        self.migrations_table = name;
+        Ok(self)
     }
 
     /// Interpolates a SQL string replacing the placeholders with configured table names.
@@ -69,6 +146,7 @@ impl SqlSchemaConfig {
         sql.replace("{events_table}", &self.events_table)
             .replace("{checkpoints_table}", &self.checkpoints_table)
             .replace("{idempotency_table}", &self.idempotency_table)
+            .replace("{snapshots_table}", &self.snapshots_table)
             .replace("{migrations_table}", &self.migrations_table)
     }
 }
@@ -102,8 +180,6 @@ pub fn get_migrations(dialect: SqlDialect) -> Vec<SchemaMigration> {
                         recorded_at_ms INTEGER NOT NULL,
                         UNIQUE (aggregate_type, aggregate_id, revision)
                     );
-                    CREATE INDEX IF NOT EXISTS {events_table}_stream_idx
-                        ON {events_table} (aggregate_type, aggregate_id, revision);
                 "#,
             },
             SchemaMigration {
@@ -128,6 +204,29 @@ pub fn get_migrations(dialect: SqlDialect) -> Vec<SchemaMigration> {
                     );
                 "#,
             },
+            SchemaMigration {
+                version: 4,
+                description: "create_snapshots_table",
+                up_sql: r#"
+                    CREATE TABLE IF NOT EXISTS {snapshots_table} (
+                        aggregate_type TEXT NOT NULL,
+                        aggregate_id TEXT NOT NULL,
+                        revision INTEGER NOT NULL,
+                        state TEXT NOT NULL,
+                        metadata TEXT NOT NULL,
+                        recorded_at_ms INTEGER NOT NULL,
+                        PRIMARY KEY (aggregate_type, aggregate_id)
+                    );
+                "#,
+            },
+            SchemaMigration {
+                version: 5,
+                description: "create_events_global_replay_index",
+                up_sql: r#"
+                    CREATE INDEX IF NOT EXISTS {events_table}_global_replay_idx
+                        ON {events_table} (aggregate_type, sequence);
+                "#,
+            },
         ],
         SqlDialect::Postgres => vec![
             SchemaMigration {
@@ -147,8 +246,6 @@ pub fn get_migrations(dialect: SqlDialect) -> Vec<SchemaMigration> {
                         recorded_at_ms BIGINT NOT NULL,
                         UNIQUE (aggregate_type, aggregate_id, revision)
                     );
-                    CREATE INDEX IF NOT EXISTS {events_table}_stream_idx
-                        ON {events_table} (aggregate_type, aggregate_id, revision);
                 "#,
             },
             SchemaMigration {
@@ -173,6 +270,29 @@ pub fn get_migrations(dialect: SqlDialect) -> Vec<SchemaMigration> {
                     );
                 "#,
             },
+            SchemaMigration {
+                version: 4,
+                description: "create_snapshots_table",
+                up_sql: r#"
+                    CREATE TABLE IF NOT EXISTS {snapshots_table} (
+                        aggregate_type TEXT NOT NULL,
+                        aggregate_id TEXT NOT NULL,
+                        revision BIGINT NOT NULL,
+                        state JSONB NOT NULL,
+                        metadata JSONB NOT NULL,
+                        recorded_at_ms BIGINT NOT NULL,
+                        PRIMARY KEY (aggregate_type, aggregate_id)
+                    );
+                "#,
+            },
+            SchemaMigration {
+                version: 5,
+                description: "create_events_global_replay_index",
+                up_sql: r#"
+                    CREATE INDEX IF NOT EXISTS {events_table}_global_replay_idx
+                        ON {events_table} (aggregate_type, sequence);
+                "#,
+            },
         ],
         SqlDialect::MySql => vec![
             SchemaMigration {
@@ -190,8 +310,7 @@ pub fn get_migrations(dialect: SqlDialect) -> Vec<SchemaMigration> {
                         payload JSON NOT NULL,
                         metadata JSON NOT NULL,
                         recorded_at_ms BIGINT NOT NULL,
-                        UNIQUE KEY (aggregate_type, aggregate_id, revision),
-                        INDEX (aggregate_type, aggregate_id, revision)
+                        UNIQUE KEY (aggregate_type, aggregate_id, revision)
                     );
                 "#,
             },
@@ -217,16 +336,41 @@ pub fn get_migrations(dialect: SqlDialect) -> Vec<SchemaMigration> {
                     );
                 "#,
             },
+            SchemaMigration {
+                version: 4,
+                description: "create_snapshots_table",
+                up_sql: r#"
+                    CREATE TABLE IF NOT EXISTS {snapshots_table} (
+                        aggregate_type VARCHAR(255) NOT NULL,
+                        aggregate_id VARCHAR(255) NOT NULL,
+                        revision BIGINT NOT NULL,
+                        state JSON NOT NULL,
+                        metadata JSON NOT NULL,
+                        recorded_at_ms BIGINT NOT NULL,
+                        PRIMARY KEY (aggregate_type, aggregate_id)
+                    );
+                "#,
+            },
+            SchemaMigration {
+                version: 5,
+                description: "create_events_global_replay_index",
+                up_sql: r#"
+                    CREATE INDEX {events_table}_global_replay_idx
+                        ON {events_table} (aggregate_type, sequence);
+                "#,
+            },
         ],
     }
 }
 
-#[allow(dead_code)]
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
 fn get_target_table_name(version: i32, config: &SqlSchemaConfig) -> &str {
     match version {
         1 => &config.events_table,
         2 => &config.checkpoints_table,
         3 => &config.idempotency_table,
+        4 => &config.snapshots_table,
+        5 => &config.events_table,
         _ => "",
     }
 }
@@ -243,28 +387,36 @@ fn get_target_table_name(version: i32, config: &SqlSchemaConfig) -> &str {
 /// them to a live MySQL environment.
 #[derive(Debug, Clone)]
 pub struct SchemaMigrator {
-    #[allow(dead_code)]
+    #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
     config: SqlSchemaConfig,
 }
 
 impl SchemaMigrator {
     /// Creates a migrator for a given configuration.
     pub fn new(config: SqlSchemaConfig) -> Self {
-        Self { config }
+        #[cfg(not(any(feature = "sqlite", feature = "postgres", feature = "mysql")))]
+        {
+            let _ = config;
+            Self {}
+        }
+
+        #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+        {
+            Self { config }
+        }
     }
 
-    #[allow(dead_code)]
+    #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
     fn validate_config(&self) -> Result<(), EventStoreError> {
-        crate::sql_common::validate_table_name(&self.config.events_table)?;
-        crate::sql_common::validate_table_name(&self.config.checkpoints_table)?;
-        crate::sql_common::validate_table_name(&self.config.idempotency_table)?;
-        crate::sql_common::validate_table_name(&self.config.migrations_table)?;
-        Ok(())
+        self.config.validate()
     }
 
     /// Runs SQLite migrations.
     #[cfg(feature = "sqlite")]
     pub fn run_sqlite(&self, conn: &rusqlite::Connection) -> Result<(), EventStoreError> {
+        #[cfg(feature = "tracing")]
+        let _span = tracing::debug_span!("schema.migrate", dialect = "sqlite").entered();
+
         self.validate_config()?;
 
         // 1. Ensure migrations table exists (with composite key)
@@ -370,6 +522,9 @@ impl SchemaMigrator {
     /// Runs PostgreSQL migrations.
     #[cfg(feature = "postgres")]
     pub fn run_postgres(&self, client: &mut postgres::Client) -> Result<(), EventStoreError> {
+        #[cfg(feature = "tracing")]
+        let _span = tracing::debug_span!("schema.migrate", dialect = "postgres").entered();
+
         self.validate_config()?;
 
         // 1. Ensure migrations table exists
@@ -474,6 +629,9 @@ impl SchemaMigrator {
     /// Runs MySQL migrations.
     #[cfg(feature = "mysql")]
     pub fn run_mysql(&self, conn: &mut mysql::Conn) -> Result<(), EventStoreError> {
+        #[cfg(feature = "tracing")]
+        let _span = tracing::debug_span!("schema.migrate", dialect = "mysql").entered();
+
         use mysql::prelude::Queryable;
         self.validate_config()?;
 
@@ -534,8 +692,32 @@ impl SchemaMigrator {
             if !applied_pairs.contains(&(m.version, target_table.to_string())) {
                 // Execute migration SQL (using standard query_drop)
                 let sql = self.config.interpolate(m.up_sql);
-                conn.query_drop(&sql)
-                    .map_err(|e| EventStoreError::Backend(e.to_string()))?;
+                if m.version == 5 {
+                    let events_table = self.config.events_table.as_str();
+                    let index_name = format!("{events_table}_global_replay_idx");
+                    let index_exists_query = format!(
+                        "SELECT COUNT(1) > 0 FROM information_schema.statistics \
+                         WHERE table_schema = DATABASE() \
+                         AND table_name = '{}' \
+                         AND index_name = '{}';",
+                        events_table, index_name
+                    );
+                    let index_exists = conn
+                        .query_first(&index_exists_query)
+                        .map(|row_opt| {
+                            row_opt
+                                .and_then(|row: mysql::Row| row.get::<bool, _>(0))
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if !index_exists {
+                        conn.query_drop(&sql)
+                            .map_err(|e| EventStoreError::Backend(e.to_string()))?;
+                    }
+                } else {
+                    conn.query_drop(&sql)
+                        .map_err(|e| EventStoreError::Backend(e.to_string()))?;
+                }
 
                 // Version 2 compatibility copy
                 if m.version == 2 {

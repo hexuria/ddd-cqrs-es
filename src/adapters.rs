@@ -2665,10 +2665,14 @@ static FILE_LOCKS: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 #[cfg(feature = "json-file")]
-fn get_file_lock(path: &std::path::Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+fn get_file_lock(
+    path: &std::path::Path,
+) -> Result<std::sync::Arc<std::sync::Mutex<()>>, crate::error::EventStoreError> {
     let map_lock =
         FILE_LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let mut map = map_lock.lock().unwrap();
+    let mut map = map_lock
+        .lock()
+        .map_err(|_| crate::error::EventStoreError::Poisoned)?;
     let canonical = if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
         if let Ok(canon_parent) = parent.canonicalize() {
@@ -2683,9 +2687,10 @@ fn get_file_lock(path: &std::path::Path) -> std::sync::Arc<std::sync::Mutex<()>>
     } else {
         path.to_path_buf()
     };
-    map.entry(canonical)
+    Ok(map
+        .entry(canonical)
         .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
-        .clone()
+        .clone())
 }
 
 #[cfg(feature = "json-file")]
@@ -2766,8 +2771,10 @@ where
         &self,
         aggregate_id: &A::Id,
     ) -> Result<crate::event_store::EventStream<A>, Self::Error> {
-        let lock = get_file_lock(&self.events_path);
-        let _guard = lock.lock().unwrap();
+        let lock = get_file_lock(&self.events_path)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| crate::error::EventStoreError::Poisoned)?;
 
         if !self.events_path.exists() {
             return Ok(Vec::new());
@@ -2820,8 +2827,10 @@ where
         expected_revision: crate::event::ExpectedRevision,
         events: Vec<crate::event::NewEvent<A::Event>>,
     ) -> Result<crate::event_store::EventStream<A>, Self::Error> {
-        let lock = get_file_lock(&self.events_path);
-        let _guard = lock.lock().unwrap();
+        let lock = get_file_lock(&self.events_path)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| crate::error::EventStoreError::Poisoned)?;
 
         if let Some(parent) = self.events_path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -2946,8 +2955,10 @@ where
         &self,
         sequence: Option<u64>,
     ) -> Result<crate::event_store::EventStream<A>, Self::Error> {
-        let lock = get_file_lock(&self.events_path);
-        let _guard = lock.lock().unwrap();
+        let lock = get_file_lock(&self.events_path)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| crate::error::EventStoreError::Poisoned)?;
 
         if !self.events_path.exists() {
             return Ok(Vec::new());
@@ -3062,8 +3073,10 @@ impl crate::projection::CheckpointStore for JsonFileCheckpointStore {
     type Error = crate::error::EventStoreError;
 
     fn load_checkpoint(&self, projection_name: &str) -> Result<Option<u64>, Self::Error> {
-        let lock = get_file_lock(&self.checkpoints_path);
-        let _guard = lock.lock().unwrap();
+        let lock = get_file_lock(&self.checkpoints_path)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| crate::error::EventStoreError::Poisoned)?;
 
         if !self.checkpoints_path.exists() {
             return Ok(None);
@@ -3079,8 +3092,10 @@ impl crate::projection::CheckpointStore for JsonFileCheckpointStore {
     }
 
     fn save_checkpoint(&self, projection_name: &str, sequence: u64) -> Result<(), Self::Error> {
-        let lock = get_file_lock(&self.checkpoints_path);
-        let _guard = lock.lock().unwrap();
+        let lock = get_file_lock(&self.checkpoints_path)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| crate::error::EventStoreError::Poisoned)?;
 
         if let Some(parent) = self.checkpoints_path.parent() {
             let _ = std::fs::create_dir_all(parent);
