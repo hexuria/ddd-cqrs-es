@@ -2,9 +2,38 @@
 
 [![ci](https://github.com/codeitlikemiley/ddd-cqrs-es/actions/workflows/ci.yml/badge.svg)](https://github.com/codeitlikemiley/ddd-cqrs-es/actions/workflows/ci.yml)
 
-A lightweight, infrastructure-light Domain-Driven Design (DDD), CQRS, and Event Sourcing framework for Rust.
+## Documentation
 
-Decouple your core business logic completely from databases, serialization, web frameworks, and asynchronous runtimes. Design pure domain aggregates, enforce transactional consistency boundaries, and build rich read models with minimal friction.
+- **Live documentation:** [https://ddd-cqrs-es.goldcoders.dev](https://ddd-cqrs-es.goldcoders.dev)
+
+<p align="center">
+  <img src="./assets/readme-banner.png" alt="ddd_cqrs_es banner" width="100%" />
+</p>
+
+ddd_cqrs_es is a Rust-native **Domain-Driven Design + CQRS + Event Sourcing** framework designed to stay out of your way.
+
+**Our USP (what differentiates us):**
+
+- **Domain-first API:** your aggregate, repository, and command logic remain separate from transport, serialization, and application frameworks.
+- **Backend parity in one crate:** stable SQL abstractions for SQLite, PostgreSQL, and MySQL with one repository surface, plus targeted WASI/Spin/Redis adapters for edge and async environments.
+- **Production-ready consistency model:** explicit atomic append path where available, durable checkpoints, snapshots, and idempotency support instead of toy examples.
+- **Migration-aware and evolvable:** built-in support patterns for versioned events through upcasting and operationally minded docs for long-lived systems.
+- **Library-first philosophy:** a reusable core with explicit feature gates and examples, instead of framework-locked opinionated app scaffolding.
+
+**Architecture + deployment story (what this crate is for):**
+
+This is not an app framework. It is an architectural crate that turns domain models and business rules into a composable core you can deploy as:
+
+- High-throughput APIs for web backends
+- Real-time apps and interactive workflows
+- Multi-runtime services (native + WASI targets)
+
+The active stack we use includes:
+- [Leptos](https://github.com/leptos-rs/leptos) for full-stack Rust UI and server functions
+- [leptos_wasi](https://github.com/leptos-rs/leptos_wasi) for Leptos server-side in WASI environments (we maintain this)
+- [leptos-spin](https://github.com/spinframework/leptos-spin) templates for Spin runtime apps (we maintain this)
+- [Spin](https://github.com/spinframework/spin) for Wasm-first serverless execution
+- [spin-operator](https://github.com/spinframework/spin-operator) and [SpinKube](https://www.spinkube.dev) for production deployment on Kubernetes at scale
 
 ---
 
