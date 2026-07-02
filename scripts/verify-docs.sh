@@ -16,11 +16,11 @@ cleanup() {
 trap cleanup EXIT
 
 jq -r '.navigation.groups[].pages[]' "$DOCS_JSON" | sort | grep -v '^README$' > "$nav_pages"
-if command -v rg >/dev/null 2>&1; then
-  rg --files docs -g '*.md' | rg -v '^docs/README\.md$' | sed 's#^docs/##' | sed 's#\.md$##' | sort > "$fs_pages"
-else
-  find docs -type f -name '*.md' | rg -v '/README\.md$' | sed 's#^docs/##' | sed 's#\.md$##' | sort > "$fs_pages"
-fi
+find docs -type f -name '*.md' \
+  | grep -v '/README\.md$' \
+  | sed 's#^docs/##' \
+  | sed 's#\.md$##' \
+  | sort > "$fs_pages"
 
 if ! diff -u "$nav_pages" "$fs_pages" > /tmp/verify-docs.diff; then
   echo "Documentation navigation mismatch detected."
