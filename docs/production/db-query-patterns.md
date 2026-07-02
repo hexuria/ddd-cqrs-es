@@ -24,7 +24,35 @@ The SQL event-store adapters use these hot paths:
 The framework schema creates a global replay index on `(aggregate_type,
 sequence)` because projection replay is aggregate-type scoped. The stream
 uniqueness constraint already covers stream loads, so a second identical stream
-index is unnecessary in fresh schemas.
+index is unnecessary in fresh schemas. Schema migration v6 removes the old
+duplicate `{events_table}_stream_idx` index when it exists:
+
+- SQLite and PostgreSQL drop `{events_table}_stream_idx` directly with `DROP
+  INDEX IF EXISTS`.
+- MySQL discovers non-unique indexes whose ordered columns are exactly
+  `(aggregate_type, aggregate_id, revision)` and drops only those duplicates,
+  preserving the unique stream constraint and the global replay index.
+
+## Bounded Projection Replay
+
+`EventStore::load_global_after` and projection runner `run(...)` methods remain
+available for compatibility, but they load the full backlog after the
+checkpoint. Production workers should prefer the bounded APIs:
+
+```rust
+use ddd_cqrs_es::ProjectionBatchConfig;
+
+let config = ProjectionBatchConfig::default();
+let outcome = runner.run_batch::<BankAccount, _>(&event_store, config)?;
+
+if !outcome.caught_up {
+    // Schedule another batch immediately or let the worker loop continue.
+}
+```
+
+The default batch size is `500`. SQL adapters apply `LIMIT`, Redis uses
+`ZRANGEBYSCORE ... LIMIT`, and the in-memory store uses iterator `take`, so the
+bounded path avoids fetching an unbounded tail in production adapters.
 
 ## Read Models Own Product Queries
 
@@ -120,3 +148,34 @@ Before adding a database query:
   optimized.
 - Update this guide and the counter-app docs when a new query pattern becomes
   part of the recommended workflow.
+
+## Verifying Plans
+
+The test suite includes SQLite planner assertions by default when the `sqlite`
+feature is enabled. PostgreSQL and MySQL plan tests are live-gated:
+
+```bash
+cargo test --all-features sqlite_query_plans_use_expected_access_paths
+DDD_CQRS_ES_POSTGRES_URL=postgresql://localhost/ddd_test \
+  cargo test --all-features postgres_query_plans_use_expected_indexes_when_url_is_provided
+DDD_CQRS_ES_MYSQL_URL=mysql://root:password@127.0.0.1:3306/ddd_test \
+  cargo test --all-features test_mysql_query_plans_and_v6_duplicate_index_cleanup
+```
+
+To inspect an existing database manually, list duplicate stream indexes before
+and after running schema migration v6:
+
+```sql
+-- PostgreSQL
+SELECT indexname, indexdef
+FROM pg_indexes
+WHERE tablename = 'events';
+
+-- MySQL
+SELECT index_name, non_unique,
+       GROUP_CONCAT(column_name ORDER BY seq_in_index) AS columns_in_order
+FROM information_schema.statistics
+WHERE table_schema = DATABASE()
+  AND table_name = 'events'
+GROUP BY index_name, non_unique;
+```

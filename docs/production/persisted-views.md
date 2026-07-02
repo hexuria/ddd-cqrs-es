@@ -55,11 +55,17 @@ Our Projection Runner guarantees sequential processing by executing in a single 
 
 To run a persisted projection in production, you can use the built-in `PersistedProjectionRunner` (for synchronous event stores) or `AsyncPersistedProjectionRunner` (for async event stores), paired with a checkpoint store (such as `SqliteCheckpointStore` or `PostgresCheckpointStore`).
 
+Use `run_batch(...)` for production workers so each loop loads a bounded
+backlog slice. The compatibility `run(...)` methods still exist, but they load
+all events after the checkpoint and should be reserved for tests, small local
+tools, or one-off maintenance jobs where the backlog size is known.
+
 ### Example: Sync Sqlite Projection Runner
 
 ```rust
 use ddd_cqrs_es::{
     SqliteEventStore, SqliteCheckpointStore, PersistedProjectionRunner,
+    ProjectionBatchConfig,
 };
 
 fn run_my_projection(
@@ -81,8 +87,8 @@ fn run_my_projection(
     // advances the checkpoint for each successful event sequence.
     // Projection writes and checkpoint writes are not one transaction, so the
     // projection must be idempotent.
-    let processed_count = runner.run(event_store)?;
-    println!("Processed {} new events", processed_count);
+    let outcome = runner.run_batch(event_store, ProjectionBatchConfig::default())?;
+    println!("Processed {} new events", outcome.applied);
 
     Ok(())
 }
@@ -93,6 +99,7 @@ fn run_my_projection(
 ```rust
 use ddd_cqrs_es::{
     PostgresEventStore, PostgresCheckpointStore, PersistedProjectionRunner,
+    ProjectionBatchConfig,
 };
 
 fn run_my_postgres_projection(
@@ -105,8 +112,8 @@ fn run_my_postgres_projection(
     );
 
     // Trigger a projection poll run.
-    let processed_count = runner.run(event_store)?;
-    println!("Processed {} new events", processed_count);
+    let outcome = runner.run_batch(event_store, ProjectionBatchConfig::default())?;
+    println!("Processed {} new events", outcome.applied);
 
     Ok(())
 }

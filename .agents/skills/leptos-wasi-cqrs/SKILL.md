@@ -175,7 +175,7 @@ Before adding or changing SQL, match each query to the access pattern documented
 - Do not query event `payload` JSON for product screens. Project business fields into a read model and index that read model for the UI query.
 - Do not add duplicate indexes that mirror a unique constraint unless an actual query planner check proves a need.
 - Checkpoint saves must be monotonic. A stale checkpoint write must not move `sequence` backward.
-- Projection catch-up from durable events can be expensive. Keep it outside hot request paths or make the backlog strategy explicit when event volume can grow.
+- Projection catch-up from durable events can be expensive. Production examples must use `run_batch(...)`, `ProjectionBatchConfig`, or `load_global_after_limited(...)`; reserve unbounded `run(...)` / `load_global_after(...)` for small tests or explicit maintenance jobs.
 
 When explaining eventual consistency, state both sides plainly: it keeps command writes small and read models scalable, but read models and realtime notifications can lag, duplicate, or arrive out of order. Redis/SSE/WebSocket are wake transports; durable replay by sequence remains the truth. For optimistic UI, never let an older server-action or SSE snapshot rewind a newer visible sequence.
 

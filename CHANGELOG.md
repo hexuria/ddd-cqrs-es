@@ -11,3 +11,6 @@
 - Added `ProjectionRunnerError` `Display` and `Error` implementations.
 - Added configurable event-store contract-test sequence expectations.
 - Optimized `execute_returning_state` to avoid a second stream load.
+- Added bounded global replay and projection batch APIs for production catch-up loops.
+- Added schema migration v6 to remove legacy duplicate stream indexes while preserving unique stream constraints.
+- Added query-plan coverage for SQLite and live-gated PostgreSQL/MySQL adapter checks.
