@@ -1,4 +1,5 @@
 use std::marker::PhantomData;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 #[cfg(any(
@@ -18,6 +19,7 @@ use async_trait::async_trait;
 static SCHEMA_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static SCHEMA_INIT_LOCK: OnceLock<futures::lock::Mutex<()>> = OnceLock::new();
 static PROJECTION_RUN_LOCK: OnceLock<futures::lock::Mutex<()>> = OnceLock::new();
+const COUNTER_PROJECTION_BATCH_SIZE: usize = 128;
 
 // =========================================================================
 // ENVIRONMENT CONFIGURATION HELPERS
@@ -827,6 +829,95 @@ where
         let query_postgres = "SELECT sequence, event_id, aggregate_id, aggregate_type, revision, event_type, event_version, payload, metadata, recorded_at_ms FROM events WHERE sequence > $1 ORDER BY sequence ASC";
 
         let params = vec![serde_json::Value::Number(seq.into())];
+        let rows = execute_query_routed(query_sqlite, query_postgres, params).await
+            .map_err(EventStoreError::Backend)?;
+
+        let mut envelopes = Vec::new();
+        for r in rows {
+            envelopes.push(ddd_cqrs_es::adapters::row_to_envelope::<A::Event, A::Id>(&r).map_err(EventStoreError::Deserialization)?);
+        }
+        Ok(envelopes)
+    }
+
+    async fn load_global_after_limited(
+        &self,
+        sequence: Option<u64>,
+        limit: NonZeroUsize,
+    ) -> Result<Vec<EventEnvelope<A::Event, A::Id>>, Self::Error> {
+        let backend = get_backend();
+        let seq = sequence.unwrap_or(0);
+        let limit_u64 = u64::try_from(limit.get()).map_err(|_| {
+            EventStoreError::Backend("projection batch size exceeds u64".to_string())
+        })?;
+
+        if backend == "redis" {
+            #[cfg(feature = "redis")]
+            {
+                #[cfg(any(
+                    all(feature = "spin-redis", runtime_spin),
+                    all(feature = "wasi-redis", runtime_wasmtime)
+                ))]
+                {
+                    let store = ddd_cqrs_es::RedisEventStore::<A, _>::new(redis_client());
+                    return store.load_global_after_limited(sequence, limit).await;
+                }
+                #[cfg(not(any(
+                    all(feature = "spin-redis", runtime_spin),
+                    all(feature = "wasi-redis", runtime_wasmtime)
+                )))]
+                {
+                    return Err(EventStoreError::Backend(
+                        "redis backend requires WASI_RUNTIME=spin or WASI_RUNTIME=wasmtime".to_string(),
+                    ));
+                }
+            }
+            #[cfg(not(feature = "redis"))]
+            {
+                return Err(EventStoreError::Backend("redis feature not enabled".to_string()));
+            }
+        }
+
+        if backend == "sqlite" {
+            #[cfg(runtime_spin)]
+            {
+                #[cfg(feature = "sqlite")]
+                {
+                    let query = "SELECT sequence, event_id, aggregate_id, aggregate_type, revision, event_type, event_version, payload, metadata, recorded_at_ms FROM events WHERE sequence > ? ORDER BY sequence ASC LIMIT ?";
+                    let params = vec![
+                        serde_json::Value::Number(seq.into()),
+                        serde_json::Value::Number(limit_u64.into()),
+                    ];
+                    let rows = ddd_cqrs_es::adapters::execute_spin_sqlite(query, params).await
+                        .map_err(EventStoreError::Backend)?;
+                    let mut envelopes = Vec::new();
+                    for r in rows {
+                        envelopes.push(ddd_cqrs_es::adapters::row_to_envelope::<A::Event, A::Id>(&r).map_err(EventStoreError::Deserialization)?);
+                    }
+                    return Ok(envelopes);
+                }
+                #[cfg(not(feature = "sqlite"))]
+                {
+                    return Err(EventStoreError::Backend("sqlite feature not enabled".to_string()));
+                }
+            }
+            #[cfg(runtime_wasmtime)]
+            {
+                let store = ddd_cqrs_es::adapters::JsonFileEventStore::<A>::new("/data/events.json");
+                return AsyncEventStore::load_global_after_limited(&store, Some(seq), limit).await;
+            }
+        }
+
+        let query_sqlite = if backend == "mysql" {
+            "SELECT sequence, event_id, aggregate_id, aggregate_type, revision, event_type, event_version, CAST(payload AS CHAR(10000) CHARACTER SET utf8mb4) AS payload, CAST(metadata AS CHAR(10000) CHARACTER SET utf8mb4) AS metadata, recorded_at_ms FROM events WHERE sequence > ? ORDER BY sequence ASC LIMIT ?"
+        } else {
+            "SELECT sequence, event_id, aggregate_id, aggregate_type, revision, event_type, event_version, payload, metadata, recorded_at_ms FROM events WHERE sequence > ? ORDER BY sequence ASC LIMIT ?"
+        };
+        let query_postgres = "SELECT sequence, event_id, aggregate_id, aggregate_type, revision, event_type, event_version, payload, metadata, recorded_at_ms FROM events WHERE sequence > $1 ORDER BY sequence ASC LIMIT $2";
+
+        let params = vec![
+            serde_json::Value::Number(seq.into()),
+            serde_json::Value::Number(limit_u64.into()),
+        ];
         let rows = execute_query_routed(query_sqlite, query_postgres, params).await
             .map_err(EventStoreError::Backend)?;
 
@@ -1739,8 +1830,15 @@ async fn run_redis_counter_projection_atomic(
 
     let projection = RedisAtomicCounterProjection;
     let mut runner = AsyncCheckpointedProjectionRunner::new(projection);
-    runner.run(event_store).await
-        .map_err(|error| format!("atomic runner error: {:?}", error))
+    let config = ddd_cqrs_es::ProjectionBatchConfig::new(counter_projection_batch_limit()?);
+    let outcome = runner.run_batch(event_store, config).await
+        .map_err(|error| format!("atomic runner error: {:?}", error))?;
+    Ok(outcome.applied)
+}
+
+fn counter_projection_batch_limit() -> Result<NonZeroUsize, String> {
+    NonZeroUsize::new(COUNTER_PROJECTION_BATCH_SIZE)
+        .ok_or_else(|| "counter projection batch size must be non-zero".to_string())
 }
 
 pub async fn run_projections_async(
@@ -1768,7 +1866,9 @@ pub async fn run_projections_async(
     let last_sequence = checkpoint_store.load_checkpoint_async("counter_projection").await
         .map_err(|e| e.to_string())?;
         
-    let envelopes = event_store.load_global_after(last_sequence).await
+    let envelopes = event_store
+        .load_global_after_limited(last_sequence, counter_projection_batch_limit()?)
+        .await
         .map_err(|e| e.to_string())?;
         
     let count = envelopes.len();
