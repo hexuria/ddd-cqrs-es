@@ -4,7 +4,7 @@
 
 ## Documentation
 
-- **Live documentation:** [https://ddd-cqrs-es.goldcoders.dev](https://ddd-cqrs-es.goldcoders.dev)
+- **Live documentation:** [https://goldcoderscorp.mintlify.site/](https://goldcoderscorp.mintlify.site/)
 
 <p align="center">
   <img src="./assets/readme-banner.png" alt="ddd_cqrs_es banner" width="100%" />
@@ -83,7 +83,7 @@ See full runtime/feature details in the docs.
 
 ## More docs
 
-- [Live docs homepage](https://ddd-cqrs-es.goldcoders.dev)
+- [Live docs homepage](https://goldcoderscorp.mintlify.site/)
 - [docs/index.md](./docs/index.md)
 - [docs/README.md](./docs/README.md)
 
