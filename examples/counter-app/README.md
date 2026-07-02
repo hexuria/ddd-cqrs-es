@@ -97,7 +97,8 @@ make db=mysql fresh
 make db=redis fresh
 ```
 
-`db=mysql` uses `MYSQL_URL` first, then falls back to `DATABASE_URL`.
+`db=mysql` requires `MYSQL_URL`. `DATABASE_URL` is an internal runtime value
+derived by the Makefile, not a public fallback.
 
 ```bash
 make db=mysql fresh
@@ -234,7 +235,9 @@ Important variables:
 
 `make db=<backend>` and `make realtime=<mode>` override `.env` for one
 command. The Makefile derives the internal `DATABASE_URL` and
-`DATABASE_AUTH_TOKEN` values from the backend-specific variables above.
+`DATABASE_AUTH_TOKEN` values from the backend-specific variables above. Do not
+set `DATABASE_URL` or `DATABASE_AUTH_TOKEN` in `.env` for normal counter-app
+workflows.
 
 ## Runtime Setup Details
 
@@ -252,7 +255,7 @@ Backend URL derivation:
 | `supabase` | `SUPABASE_URL`, `SUPABASE_SECRET_KEY` | `DATABASE_URL=$SUPABASE_URL`, `DATABASE_AUTH_TOKEN=$SUPABASE_SECRET_KEY` |
 | `turso` | `TURSO_URL`, `TURSO_AUTH_TOKEN` | `DATABASE_URL=$TURSO_URL`, `DATABASE_AUTH_TOKEN=$TURSO_AUTH_TOKEN` |
 | `mysql` | `MYSQL_URL` | `DATABASE_URL=$MYSQL_URL` |
-| `redis` | `REDIS_URL` | `DATABASE_URL=$REDIS_URL` |
+| `redis` | `REDIS_URL` | `REDIS_URL=$REDIS_URL` |
 
 For `realtime=redis`, also pass `REALTIME_BACKEND=redis`, `REDIS_URL`, and
 `REDIS_CHANNEL`. Redis realtime is notification-only unless `db=redis` is also
@@ -305,6 +308,11 @@ Wasmtime setup:
 - Mount local JSON-file state at `/data` for `db=sqlite`.
 - Enable Preview 3, HTTP, TCP, inherited networking, and DNS lookup.
 - Pass the same runtime env vars that the Makefile derives.
+- Add `DATABASE_URL` only for `db=postgres`, `db=neon`, `db=supabase`,
+  `db=turso`, or `db=mysql`.
+- Add `DATABASE_AUTH_TOKEN` only for Supabase or Turso when a token is needed.
+- Add `REDIS_URL` and `REDIS_CHANNEL` only for `db=redis` or
+  `realtime=redis`.
 
 The Makefile runs the component with this shape:
 
@@ -323,14 +331,13 @@ wasmtime serve \
   --env=LEPTOS_SITE_ROOT=/ \
   --env=LEPTOS_SITE_PKG_DIR=pkg \
   --env=DATABASE_BACKEND=<sqlite|postgres|neon|supabase|turso|mysql|redis> \
-  --env=DATABASE_URL="<derived backend URL>" \
-  --env=DATABASE_AUTH_TOKEN="<derived auth token when needed>" \
   --env=REALTIME_BACKEND=<off|polling|redis> \
-  --env=REDIS_URL="redis://127.0.0.1:6379" \
-  --env=REDIS_CHANNEL="counter-events" \
   --addr 127.0.0.1:3000 \
   target/wasmtime/wasm32-wasip2/release/counter_app.wasm
 ```
+
+When bypassing Make, append the optional backend flags from the derivation table
+above yourself.
 
 ## Runtime Notes
 
