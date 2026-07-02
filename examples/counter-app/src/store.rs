@@ -33,46 +33,32 @@ fn env_non_empty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.is_empty())
 }
 
-pub fn get_postgres_url() -> String {
-    let backend = get_backend();
-    match backend.as_str() {
-        "supabase" => {
-            return env_non_empty("SUPABASE_URL")
-                .or_else(|| env_non_empty("DATABASE_URL"))
-                .unwrap_or_default();
-        }
-        "neon" => {
-            return env_non_empty("DATABASE_URL")
-                .or_else(|| env_non_empty("NEON_DB_URL"))
-                .unwrap_or_default();
-        }
-        _ => {}
-    }
+fn get_database_url() -> String {
+    env_non_empty("DATABASE_URL").unwrap_or_default()
+}
 
-    env_non_empty("DATABASE_URL")
-        .or_else(|| env_non_empty("POSTGRES_URL"))
-        .unwrap_or_else(|| "postgresql://postgres:postgres@localhost:5432/postgres".to_string())
+fn get_database_auth_token() -> Option<String> {
+    env_non_empty("DATABASE_AUTH_TOKEN")
+}
+
+pub fn get_postgres_url() -> String {
+    get_database_url()
 }
 
 pub fn get_mysql_url() -> String {
-    env_non_empty("MYSQL_URL")
-        .or_else(|| env_non_empty("DATABASE_URL"))
-        .unwrap_or_default()
+    get_database_url()
 }
 
 pub fn get_supabase_secret_key() -> Option<String> {
-    env_non_empty("SUPABASE_SECRET_KEY")
-        .or_else(|| env_non_empty("DATABASE_AUTH_TOKEN"))
+    get_database_auth_token()
 }
 
 pub fn get_turso_url() -> String {
-    env_non_empty("DATABASE_URL")
-        .or_else(|| env_non_empty("TURSO_URL"))
-        .unwrap_or_else(|| "http://127.0.0.1:8080".to_string())
+    env_non_empty("DATABASE_URL").unwrap_or_else(|| "http://127.0.0.1:8080".to_string())
 }
 
 pub fn get_turso_auth_token() -> Option<String> {
-    env_non_empty("DATABASE_AUTH_TOKEN").or_else(|| env_non_empty("TURSO_AUTH_TOKEN"))
+    get_database_auth_token()
 }
 
 pub fn get_redis_url() -> String {

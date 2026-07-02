@@ -1,5 +1,5 @@
 # Makefile for building app for different WASI runtimes
-.PHONY: help help-db help-realtime help-matrix help-env db realtime matrix env spin wasmtime clean run fresh db-reset validate-params
+.PHONY: help help-db help-realtime help-matrix help-env db realtime matrix env spin wasmtime clean run fresh db-reset validate-params validate-env
 
 DB_BACKENDS := sqlite postgres neon supabase turso mysql redis
 REALTIME_BACKENDS := off polling redis
@@ -17,8 +17,6 @@ endif
 # Preserve values supplied by the parent shell before loading .env defaults.
 # GNU make lets included files override environment-origin variables, so restore
 # these after .env is loaded to keep `REDIS_URL=... make ...` working.
-ENV_DATABASE_URL := $(if $(filter environment%,$(origin DATABASE_URL)),$(DATABASE_URL))
-ENV_DATABASE_AUTH_TOKEN := $(if $(filter environment%,$(origin DATABASE_AUTH_TOKEN)),$(DATABASE_AUTH_TOKEN))
 ENV_MYSQL_URL := $(if $(filter environment%,$(origin MYSQL_URL)),$(MYSQL_URL))
 ENV_POSTGRES_URL := $(if $(filter environment%,$(origin POSTGRES_URL)),$(POSTGRES_URL))
 ENV_NEON_DB_URL := $(if $(filter environment%,$(origin NEON_DB_URL)),$(NEON_DB_URL))
@@ -34,12 +32,6 @@ ENV_REDIS_CHANNEL := $(if $(filter environment%,$(origin REDIS_CHANNEL)),$(REDIS
 # make variables to override them.
 ifneq (,$(wildcard .env))
   include .env
-endif
-ifneq ($(ENV_DATABASE_URL),)
-  DATABASE_URL := $(ENV_DATABASE_URL)
-endif
-ifneq ($(ENV_DATABASE_AUTH_TOKEN),)
-  DATABASE_AUTH_TOKEN := $(ENV_DATABASE_AUTH_TOKEN)
 endif
 ifneq ($(ENV_MYSQL_URL),)
   MYSQL_URL := $(ENV_MYSQL_URL)
@@ -69,6 +61,7 @@ ifneq ($(ENV_REDIS_CHANNEL),)
   REDIS_CHANNEL := $(ENV_REDIS_CHANNEL)
 endif
 export
+unexport DATABASE_URL DATABASE_AUTH_TOKEN
 
 # Get db/realtime from command-line, fallback to .env, then defaults.
 
@@ -149,6 +142,54 @@ ifeq ($(REALTIME_BACKEND), redis)
   SPIN_MANIFEST := spin.redis.toml
 endif
 
+define RESOLVE_RUNTIME_ENV
+DATABASE_URL_VALUE=""; \
+DATABASE_AUTH_TOKEN_VALUE=""; \
+REDIS_URL_VALUE="$${REDIS_URL:-redis://127.0.0.1:6379}"; \
+REDIS_CHANNEL_VALUE="$${REDIS_CHANNEL:-counter-events}"; \
+case "$(DATABASE_BACKEND)" in \
+	sqlite) ;; \
+	postgres) \
+		if [ -z "$$POSTGRES_URL" ]; then \
+			echo "Error: POSTGRES_URL is required for db=postgres."; \
+			exit 1; \
+		fi; \
+		DATABASE_URL_VALUE="$$POSTGRES_URL" ;; \
+	neon) \
+		if [ -z "$$NEON_DB_URL" ]; then \
+			echo "Error: NEON_DB_URL is required for db=neon."; \
+			exit 1; \
+		fi; \
+		DATABASE_URL_VALUE="$$NEON_DB_URL" ;; \
+	supabase) \
+		if [ -z "$$SUPABASE_URL" ]; then \
+			echo "Error: SUPABASE_URL is required for db=supabase."; \
+			exit 1; \
+		fi; \
+		if [ -z "$$SUPABASE_SECRET_KEY" ]; then \
+			echo "Error: SUPABASE_SECRET_KEY is required for db=supabase."; \
+			exit 1; \
+		fi; \
+		DATABASE_URL_VALUE="$$SUPABASE_URL"; \
+		DATABASE_AUTH_TOKEN_VALUE="$$SUPABASE_SECRET_KEY" ;; \
+	turso) \
+		DATABASE_URL_VALUE="$${TURSO_URL:-http://127.0.0.1:8080}"; \
+		DATABASE_AUTH_TOKEN_VALUE="$${TURSO_AUTH_TOKEN:-}" ;; \
+	mysql) \
+		if [ -z "$$MYSQL_URL" ]; then \
+			echo "Error: MYSQL_URL is required for db=mysql."; \
+			exit 1; \
+		fi; \
+		DATABASE_URL_VALUE="$$MYSQL_URL" ;; \
+	redis) \
+		DATABASE_URL_VALUE="$$REDIS_URL_VALUE" ;; \
+esac; \
+if [ "$(DATABASE_BACKEND)" != "redis" ] && [ "$(REALTIME_BACKEND)" != "redis" ]; then \
+	REDIS_URL_VALUE=""; \
+	REDIS_CHANNEL_VALUE=""; \
+fi
+endef
+
 # Default target
 help:
 	@if [ -n "$(topic)" ]; then \
@@ -215,7 +256,7 @@ help-db:
 	@echo "  neon     - Neon Postgres HTTP SQL using NEON_DB_URL"
 	@echo "  supabase - Supabase REST using SUPABASE_URL and SUPABASE_SECRET_KEY"
 	@echo "  turso    - Turso/LibSQL Hrana HTTP using TURSO_URL and TURSO_AUTH_TOKEN"
-	@echo "  mysql    - MySQL using MYSQL_URL, falling back to DATABASE_URL"
+	@echo "  mysql    - MySQL using MYSQL_URL"
 	@echo "  redis    - Redis event/checkpoint/read-model store using REDIS_URL"
 	@echo ""
 	@echo "Public aliases such as db=psql or db=libsql are not supported; use db=postgres or db=turso."
@@ -278,8 +319,11 @@ help-env:
 	@echo "  neon:     NEON_DB_URL"
 	@echo "  supabase: SUPABASE_URL, SUPABASE_SECRET_KEY"
 	@echo "  turso:    TURSO_URL, TURSO_AUTH_TOKEN"
-	@echo "  mysql:    MYSQL_URL (falls back to DATABASE_URL)"
+	@echo "  mysql:    MYSQL_URL"
 	@echo "  redis:    REDIS_URL, REDIS_CHANNEL (optional)"
+	@echo ""
+	@echo "DATABASE_URL and DATABASE_AUTH_TOKEN are internal runtime env derived by make."
+	@echo "Do not set them in .env for normal counter-app workflows."
 	@echo ""
 	@echo "db=<backend> and realtime=<mode> override .env for one command."
 
@@ -302,38 +346,23 @@ validate-params:
 		exit 2; \
 	esac
 
+validate-env: validate-params
+	@$(RESOLVE_RUNTIME_ENV); :
+
 # Run target alias
 run: wasmtime
 
 # Reset active database tables and files
-db-reset: validate-params
+db-reset: validate-env
 	@echo "Resetting database backend: $(DATABASE_BACKEND)..."
-	@DATABASE_URL_VALUE=""; \
-	DATABASE_AUTH_TOKEN_VALUE=""; \
-	if [ "$(DATABASE_BACKEND)" = "mysql" ]; then \
-		if [ -n "$$MYSQL_URL" ]; then \
-			DATABASE_URL_VALUE="$$MYSQL_URL"; \
-		elif [ -n "$$DATABASE_URL" ]; then \
-			DATABASE_URL_VALUE="$$DATABASE_URL"; \
-		else \
-			echo "Error: Neither DATABASE_URL nor MYSQL_URL is set for MySQL reset."; \
-			exit 1; \
-		fi; \
-	fi; \
-	case "$(DATABASE_BACKEND)" in \
-		postgres) DATABASE_URL_VALUE="$$POSTGRES_URL" ;; \
-		neon) DATABASE_URL_VALUE="$$NEON_DB_URL" ;; \
-		turso) DATABASE_URL_VALUE="$$TURSO_URL"; DATABASE_AUTH_TOKEN_VALUE="$$TURSO_AUTH_TOKEN" ;; \
-		supabase) DATABASE_URL_VALUE="$$SUPABASE_URL"; DATABASE_AUTH_TOKEN_VALUE="$$SUPABASE_SECRET_KEY" ;; \
-		redis) DATABASE_URL_VALUE="$$REDIS_URL" ;; \
-	esac; \
+	@$(RESOLVE_RUNTIME_ENV); \
 	DATABASE_BACKEND=$(DATABASE_BACKEND) DATABASE_URL="$$DATABASE_URL_VALUE" DATABASE_AUTH_TOKEN="$$DATABASE_AUTH_TOKEN_VALUE" ./scripts/reset_db.sh
 
 # fresh resets the database schema host-side and returns immediately without serving
 fresh: db-reset
 
 # Build and run with Spin
-spin: validate-params
+spin: validate-env
 	@echo "Building for Spin runtime with DB: $(DATABASE_BACKEND), realtime: $(REALTIME_BACKEND)..."
 	@mkdir -p .spin
 	WASI_RUNTIME=spin DATABASE_BACKEND=$(DATABASE_BACKEND) REALTIME_BACKEND=$(REALTIME_BACKEND) cargo leptos build --release --lib-features hydrate --bin-features $(SPIN_CARGO_FEATURES)
@@ -343,30 +372,27 @@ spin: validate-params
 	fi
 	@echo "Built: target/wasm32-wasip2/release/counter_app.wasm (for Spin)"
 	@echo "Starting Spin..."
-	@DATABASE_URL_VALUE=""; \
-	DATABASE_AUTH_TOKEN_VALUE=""; \
-	REDIS_URL_VALUE="$${REDIS_URL:-redis://127.0.0.1:6379}"; \
-	REDIS_CHANNEL_VALUE="$${REDIS_CHANNEL:-counter-events}"; \
-	SPIN_VARIABLE_FLAGS=""; \
-		case "$(DATABASE_BACKEND)" in \
-			postgres) DATABASE_URL_VALUE="$$POSTGRES_URL" ;; \
-			mysql) DATABASE_URL_VALUE="$${MYSQL_URL:-$$DATABASE_URL}" ;; \
-			neon) DATABASE_URL_VALUE="$$NEON_DB_URL" ;; \
-		turso) DATABASE_URL_VALUE="$$TURSO_URL"; DATABASE_AUTH_TOKEN_VALUE="$$TURSO_AUTH_TOKEN" ;; \
-		supabase) DATABASE_URL_VALUE="$$SUPABASE_URL"; DATABASE_AUTH_TOKEN_VALUE="$$SUPABASE_SECRET_KEY" ;; \
-		redis) DATABASE_URL_VALUE="$$REDIS_URL_VALUE" ;; \
-	esac; \
-	if [ "$(DATABASE_BACKEND)" = "mysql" ] && [ -z "$$DATABASE_URL_VALUE" ]; then \
-		echo "Error: Neither DATABASE_URL nor MYSQL_URL is set for MySQL Spin."; \
-		exit 1; \
+	@$(RESOLVE_RUNTIME_ENV); \
+	set -- --from $(SPIN_MANIFEST) --env DATABASE_BACKEND=$(DATABASE_BACKEND) --env REALTIME_BACKEND=$(REALTIME_BACKEND); \
+	if [ -n "$$DATABASE_URL_VALUE" ] && [ "$(DATABASE_BACKEND)" != "redis" ]; then \
+		set -- "$$@" --env DATABASE_URL="$$DATABASE_URL_VALUE"; \
+	fi; \
+	if [ -n "$$DATABASE_AUTH_TOKEN_VALUE" ]; then \
+		set -- "$$@" --env DATABASE_AUTH_TOKEN="$$DATABASE_AUTH_TOKEN_VALUE"; \
+	fi; \
+	if [ -n "$$REDIS_URL_VALUE" ]; then \
+		set -- "$$@" --env REDIS_URL="$$REDIS_URL_VALUE"; \
+	fi; \
+	if [ -n "$$REDIS_CHANNEL_VALUE" ]; then \
+		set -- "$$@" --env REDIS_CHANNEL="$$REDIS_CHANNEL_VALUE"; \
 	fi; \
 	if [ "$(REALTIME_BACKEND)" = "redis" ]; then \
-		SPIN_VARIABLE_FLAGS="--variable redis_url=$$REDIS_URL_VALUE --variable redis_channel=$$REDIS_CHANNEL_VALUE"; \
+		set -- "$$@" --variable redis_url="$$REDIS_URL_VALUE" --variable redis_channel="$$REDIS_CHANNEL_VALUE"; \
 	fi; \
-	spin up --from $(SPIN_MANIFEST) --env DATABASE_BACKEND=$(DATABASE_BACKEND) --env DATABASE_URL="$$DATABASE_URL_VALUE" --env DATABASE_AUTH_TOKEN="$$DATABASE_AUTH_TOKEN_VALUE" --env REALTIME_BACKEND=$(REALTIME_BACKEND) --env REDIS_URL="$$REDIS_URL_VALUE" --env REDIS_CHANNEL="$$REDIS_CHANNEL_VALUE" $$SPIN_VARIABLE_FLAGS
+	spin up "$$@"
 
 # Build and run with Wasmtime
-wasmtime: validate-params
+wasmtime: validate-env
 	@echo "Building for Wasmtime runtime with DB: $(DATABASE_BACKEND), realtime: $(REALTIME_BACKEND)..."
 	WASI_RUNTIME=wasmtime DATABASE_BACKEND=$(DATABASE_BACKEND) REALTIME_BACKEND=$(REALTIME_BACKEND) cargo leptos build --release --lib-features hydrate --bin-features $(WASMTIME_CARGO_FEATURES)
 	WASI_RUNTIME=wasmtime DATABASE_BACKEND=$(DATABASE_BACKEND) REALTIME_BACKEND=$(REALTIME_BACKEND) LEPTOS_OUTPUT_NAME=counter_app cargo build --lib --target wasm32-wasip2 --release --no-default-features --features $(WASMTIME_CARGO_FEATURES) --target-dir target/wasmtime
@@ -374,23 +400,8 @@ wasmtime: validate-params
 	@echo "Starting Wasmtime serve..."
 	@echo "Serving at http://127.0.0.1:3000"
 	@mkdir -p ./data
-	@DATABASE_URL_VALUE=""; \
-	DATABASE_AUTH_TOKEN_VALUE=""; \
-	REDIS_URL_VALUE="$${REDIS_URL:-redis://127.0.0.1:6379}"; \
-	REDIS_CHANNEL_VALUE="$${REDIS_CHANNEL:-counter-events}"; \
-	case "$(DATABASE_BACKEND)" in \
-		postgres) DATABASE_URL_VALUE="$$POSTGRES_URL" ;; \
-		mysql) DATABASE_URL_VALUE="$${MYSQL_URL:-$$DATABASE_URL}" ;; \
-		neon) DATABASE_URL_VALUE="$$NEON_DB_URL" ;; \
-		turso) DATABASE_URL_VALUE="$$TURSO_URL"; DATABASE_AUTH_TOKEN_VALUE="$$TURSO_AUTH_TOKEN" ;; \
-		supabase) DATABASE_URL_VALUE="$$SUPABASE_URL"; DATABASE_AUTH_TOKEN_VALUE="$$SUPABASE_SECRET_KEY" ;; \
-		redis) DATABASE_URL_VALUE="$$REDIS_URL_VALUE" ;; \
-	esac; \
-	if [ "$(DATABASE_BACKEND)" = "mysql" ] && [ -z "$$DATABASE_URL_VALUE" ]; then \
-		echo "Error: Neither DATABASE_URL nor MYSQL_URL is set for MySQL Wasmtime."; \
-		exit 1; \
-	fi; \
-	wasmtime serve \
+	@$(RESOLVE_RUNTIME_ENV); \
+	set -- serve \
 		-W component-model-async=y \
 		-S p3=y \
 		-S cli=y \
@@ -404,13 +415,21 @@ wasmtime: validate-params
 		--env=LEPTOS_SITE_ROOT=/ \
 		--env=LEPTOS_SITE_PKG_DIR=pkg \
 		--env=DATABASE_BACKEND=$(DATABASE_BACKEND) \
-		--env=DATABASE_URL="$$DATABASE_URL_VALUE" \
-		--env=DATABASE_AUTH_TOKEN="$$DATABASE_AUTH_TOKEN_VALUE" \
-		--env=REALTIME_BACKEND=$(REALTIME_BACKEND) \
-		--env=REDIS_URL="$$REDIS_URL_VALUE" \
-		--env=REDIS_CHANNEL="$$REDIS_CHANNEL_VALUE" \
-		--addr 127.0.0.1:3000 \
-		target/wasmtime/wasm32-wasip2/release/counter_app.wasm
+		--env=REALTIME_BACKEND=$(REALTIME_BACKEND); \
+	if [ -n "$$DATABASE_URL_VALUE" ] && [ "$(DATABASE_BACKEND)" != "redis" ]; then \
+		set -- "$$@" --env=DATABASE_URL="$$DATABASE_URL_VALUE"; \
+	fi; \
+	if [ -n "$$DATABASE_AUTH_TOKEN_VALUE" ]; then \
+		set -- "$$@" --env=DATABASE_AUTH_TOKEN="$$DATABASE_AUTH_TOKEN_VALUE"; \
+	fi; \
+	if [ -n "$$REDIS_URL_VALUE" ]; then \
+		set -- "$$@" --env=REDIS_URL="$$REDIS_URL_VALUE"; \
+	fi; \
+	if [ -n "$$REDIS_CHANNEL_VALUE" ]; then \
+		set -- "$$@" --env=REDIS_CHANNEL="$$REDIS_CHANNEL_VALUE"; \
+	fi; \
+	set -- "$$@" --addr 127.0.0.1:3000 target/wasmtime/wasm32-wasip2/release/counter_app.wasm; \
+	wasmtime "$$@"
 
 # Clean target
 clean:
